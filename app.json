@@ -1,0 +1,17 @@
+{
+  "name": "KanAIRY Trading Platform",
+  "description": "Advanced MT5 Trading Platform with Appwrite Backend",
+  "repository": "https://github.com/Matlala603/KanAIRy",
+  "keywords": ["python", "fastapi", "trading", "mt5", "appwrite"],
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "PORT": {
+      "description": "Port for the web server",
+      "value": "8000"
+    }
+  }
+}

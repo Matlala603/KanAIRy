@@ -1,0 +1,31 @@
+# ============================================
+# FILENAME: backend/requirements.txt
+# ============================================
+
+# FastAPI Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Database & Appwrite
+requests==2.31.0
+python-dotenv==1.0.0
+
+# Security
+cryptography==41.0.7
+python-jose[cryptography]==3.3.0
+
+# Pydantic Models
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Trading Integration
+metaapi-cloud-sdk==22.1.0
+
+# Async
+aiofiles==23.2.1
+httpx==0.25.1
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
