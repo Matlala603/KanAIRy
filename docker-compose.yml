@@ -1,0 +1,36 @@
+# ============================================
+# FILENAME: docker-compose.yml
+# ============================================
+
+version: '3.8'
+
+services:
+  kanairy:
+    build: .
+    container_name: kanairy-trading
+    ports:
+      - "8000:8000"
+    environment:
+      - APPWRITE_ENDPOINT=${APPWRITE_ENDPOINT}
+      - APPWRITE_PROJECT_ID=${APPWRITE_PROJECT_ID}
+      - APPWRITE_API_KEY=${APPWRITE_API_KEY}
+      - METAAPI_TOKEN=${METAAPI_TOKEN}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - PORT=8000
+      - DEBUG=True
+    volumes:
+      - ./static:/app/static
+      - ./backend:/app/backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - kanairy-network
+
+networks:
+  kanairy-network:
+    driver: bridge
