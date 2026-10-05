@@ -1,0 +1,14 @@
+import { chromium } from '/home/claude/.npm-global/lib/node_modules/playwright/index.mjs';
+const out = process.env.OUT || '/tmp/shots'; const b = await chromium.launch(); const errs = [];
+const ctx = await b.newContext({ viewport: { width: 1366, height: 800 } }); const pg = await ctx.newPage();
+pg.on('pageerror', e => errs.push('pageerror: ' + e.stack)); pg.on('console', m => { if (m.type() === 'error') errs.push('console: ' + m.text()); });
+await pg.goto('http://localhost:8765/#chart'); await pg.waitForTimeout(1500);
+await pg.click('#banner button'); await pg.waitForTimeout(1200); await pg.screenshot({ path: out + '/flow1-directory.png' });
+await pg.click('#sheetRoot .bk-card >> nth=0'); await pg.waitForTimeout(500); await pg.screenshot({ path: out + '/flow2-server.png' });
+await pg.locator('.srv button').first().click(); await pg.waitForTimeout(500); await pg.screenshot({ path: out + '/flow3-creds.png' });
+console.log('inputs in creds', await pg.locator('#sheetRoot input').count());
+await pg.locator('#sheetRoot input').first().fill('123456'); await pg.locator('#sheetRoot input[type=password]').fill('pw');
+await pg.locator('#sheetRoot button.primary').last().click(); await pg.waitForTimeout(3500);
+await pg.screenshot({ path: out + '/flow4-connected.png' });
+await pg.click('.qbtn.buy').catch(e => errs.push('buy click ' + e.message)); await pg.waitForTimeout(600); await pg.screenshot({ path: out + '/flow6-ticket.png' });
+await b.close(); console.log(errs.length ? errs.join('\n') : 'no errors');

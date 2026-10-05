@@ -1,0 +1,30 @@
+{
+  "name": "KanAIRY Trading Platform",
+  "description": "MetaTrader 4 and 5 trading terminal in the browser",
+  "repository": "https://github.com/Matlala603/KanAIRy",
+  "keywords": [
+    "python",
+    "fastapi",
+    "trading",
+    "mt5"
+  ],
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "PORT": {
+      "description": "Port for the web server",
+      "value": "8000"
+    },
+    "METAAPI_TOKEN": {
+      "description": "MetaApi token",
+      "required": true
+    },
+    "SESSION_SECRET": {
+      "description": "Random secret, 16+ characters",
+      "generator": "secret"
+    }
+  }
+}

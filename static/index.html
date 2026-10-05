@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>KanAIRY — MetaTrader terminal</title>
+<meta name="description" content="Trade with any MetaTrader 4 or 5 broker. Live charts, 25+ indicators, one-tap orders, news and economic calendar.">
+<meta name="theme-color" content="#0a0f1a">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/static/img/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body data-screen="chart" data-group="terminal">
+<header id="top">
+  <button class="icon-btn" id="btnMenu" aria-label="Open menu"></button>
+  <div class="brand">KanAIRY</div>
+  <button class="acct-chip" id="acctChip" aria-label="Account">
+    <span class="status" id="statusDot"></span>
+    <span><span class="lbl" id="acctLbl">Public prices</span><br><span class="val" id="acctVal">Connect a broker</span></span>
+  </button>
+  <button class="icon-btn" id="btnAlerts" aria-label="Price alerts"></button>
+  <button class="icon-btn" id="btnTheme" aria-label="Toggle theme"></button>
+</header>
+<div id="banner" class="hide"></div>
+
+<nav id="rail" aria-label="Main"></nav>
+
+<main id="app">
+  <section id="terminal" class="view">
+    <aside class="panel" id="panelQuotes" aria-label="Market watch"></aside>
+    <section class="panel" id="panelChart" aria-label="Chart"></section>
+    <aside class="panel" id="panelTrade" aria-label="Order ticket"></aside>
+    <section class="panel" id="panelPositions" aria-label="Positions"></section>
+  </section>
+  <section class="view page" id="view-news"></section>
+  <section class="view page" id="view-calendar"></section>
+  <section class="view page" id="view-account"></section>
+  <section class="view page" id="view-strategies"></section>
+  <section class="view page" id="view-learn"></section>
+  <section class="view page" id="view-settings"></section>
+  <section class="view page" id="view-about"></section>
+  <section class="view page" id="view-developer"></section>
+  <section class="view page" id="view-assistant"></section>
+</main>
+
+<nav id="bottomNav" aria-label="Main"></nav>
+<div id="drawerScrim"></div>
+<aside id="drawer" aria-label="Menu"></aside>
+<div id="sheetRoot"></div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script type="module" src="/static/js/main.js"></script>
+<noscript>KanAIRY needs JavaScript to run.</noscript>
+</body>
+</html>
