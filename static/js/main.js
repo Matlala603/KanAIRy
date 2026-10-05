@@ -19,7 +19,7 @@ const SCREENS = [...TERMINAL, ...MENU.map(m => m[0])];
 function applyTheme() {
   document.documentElement.dataset.theme = S.settings.theme;
   if (S.settings.colorblind) document.documentElement.dataset.cb = '1'; else delete document.documentElement.dataset.cb;
-  document.querySelector('meta[name=theme-color]')?.setAttribute('content', S.settings.theme === 'dark' ? '#0a0f1a' : '#ffffff');
+  document.querySelector('meta[name=theme-color]')?.setAttribute('content', S.settings.theme === 'dark' ? '#0b0d11' : '#ffffff');
   emit('theme');
 }
 on('settings', applyTheme);

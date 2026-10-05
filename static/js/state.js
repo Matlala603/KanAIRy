@@ -19,7 +19,7 @@ export const S = {
   chartType: store.get('chartType', 'candles'),
   indicators: store.get('indicators', [{ uid: 1, id: 'ema', params: { period: 21 } }]),
   alerts: store.get('alerts', []),               // [{id,symbol,price,dir,created,fired}]
-  settings: { theme: 'dark', confirmOrders: true, colorblind: false, defaultVolume: 0.01, ...store.get('settings', {}) },
+  settings: { theme: 'light', confirmOrders: true, colorblind: false, defaultVolume: 0.01, ...store.get('settings', {}) },
   online: true,
   lastSnapshot: 0,
   catFilter: 'Favorites',
