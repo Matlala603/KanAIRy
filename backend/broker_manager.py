@@ -107,7 +107,9 @@ def explain_error(exc: Exception) -> ApiError:
         return ApiError(400, "The broker gateway rejected those account details. Check the account number, server and platform.", "validation")
     if name in ("ForbiddenException", "UnauthorizedException"):
         return ApiError(502, "The MetaApi token was refused. The server operator needs to check METAAPI_TOKEN.", "metaapi_auth")
-    logging.getLogger("kanairy").warning("upstream error: %s", name)
+    # log the exception type, its message (for KeyError this is the missing key) and the traceback,
+    # so the failing line is visible in the server logs; nothing here is returned to the client
+    logging.getLogger("kanairy").warning("upstream error: %s: %r", name, exc, exc_info=exc)
     return ApiError(502, "The broker gateway returned an error. Try again in a moment.", "upstream_error")
 
 
