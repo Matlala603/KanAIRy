@@ -87,6 +87,9 @@ async def main():
         state = "CREATED"; login = "123"; server = "Fake-Live"; metadata = None
         async def deploy(self): self.state = "DEPLOYED"
         async def wait_connected(self, *a): pass
+        async def reload(self): pass
+        connection_status = "CONNECTED"
+        replicas = []
         def get_streaming_connection(self): return FakeConn()
     class FakeConn(Conn):
         async def connect(self): pass
