@@ -60,6 +60,16 @@ export function contextMenu(x, y, header, items) {
   const r = ctxEl.getBoundingClientRect();
   ctxEl.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + 'px';
   ctxEl.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + 'px';
-  setTimeout(() => document.addEventListener('pointerdown', closeContext, { once: true, capture: true }), 0);
+  // close on any press outside the menu; presses inside must survive so the item's click can fire
+  const menu = ctxEl;
+  setTimeout(() => {
+    if (ctxEl !== menu) return;
+    ctxOff = ev => { if (menu.contains(ev.target)) return; closeContext(); };
+    document.addEventListener('pointerdown', ctxOff, true);
+  }, 0);
 }
-export function closeContext() { ctxEl?.remove(); ctxEl = null; }
+let ctxOff = null;
+export function closeContext() {
+  if (ctxOff) { document.removeEventListener('pointerdown', ctxOff, true); ctxOff = null; }
+  ctxEl?.remove(); ctxEl = null;
+}

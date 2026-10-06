@@ -177,7 +177,7 @@ export function mountChart(root) {
       chart.setData(cs, { tfSeconds: TF_SEC[S.tf], digits: digitsOf(S.symbol) });
       chart.setDrawings(drawingsFor(S.symbol)); chart.setMarkers(hooks.markers);
       paintLevels(); paintQuote();
-      clearInterval(tailTimer); tailTimer = setInterval(refreshTail, isBroker() ? 15000 : 45000);
+      clearInterval(tailTimer); tailTimer = setInterval(refreshTail, isBroker() ? 5000 : 12000);
     } catch (e) {
       if (e.name === 'AbortError' || id !== loadId) return;
       msg.classList.remove('hide'); clear(msg).append(h('b', {}, 'Chart unavailable'), h('div', { style: { margin: '4px 0 12px' } }, e.message), h('button', { class: 'btn sm', onclick: load }, 'Try again'));
@@ -187,6 +187,7 @@ export function mountChart(root) {
     if (document.hidden || !chart?.raw.length || $('body').dataset.group !== 'terminal') return;
     try { const cs = await candles(S.symbol, S.tf, 4); chart.mergeTail(cs.slice(-4)); } catch { /* next tick */ }
   }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshTail(); });
   async function loadOlder() {
     if (!isBroker() || !chart.raw.length) return;
     const id = loadId, first = chart.raw[0].t;

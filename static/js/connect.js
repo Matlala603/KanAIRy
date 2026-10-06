@@ -112,12 +112,12 @@ export function openConnect(onConnected, preset) {
     sheet.setFooter([h('button', { class: 'btn', onclick: () => sheet.close() }, 'Cancel')]);
     let cancelled = false; const prevClose = sheet.close; sheet.close = () => { cancelled = true; prevClose(); };
     try {
-      const { job } = await api.connect({ login, password, server, platform: 'mt' + plat, broker_name: broker });
+      const { job, poll } = await api.connect({ login, password, server, platform: 'mt' + plat, broker_name: broker });
       const t0 = Date.now();
       while (!cancelled) {
         await new Promise(r => setTimeout(r, 1500));
-        if (Date.now() - t0 > 420000) throw new Error('Connecting is taking too long. Check the server name and try again.');
-        const st = await api.connectStatus(job);
+        if (Date.now() - t0 > 240000) throw new Error('Connecting is taking too long. Check the server name, account number and trading password, then try again.');
+        const st = await api.connectStatus(job, poll);
         const idx = STEPS.findIndex(s => s[0] === st.state);
         stepEls.forEach((el, i) => { el.className = 'step' + (i < idx ? ' done' : i === idx ? ' now' : ''); el.firstChild.style.visibility = i === idx ? 'visible' : 'hidden'; el.firstChild.className = i < idx ? '' : 'spin'; if (i < idx) { el.firstChild.textContent = '✓'; el.firstChild.style.visibility = 'visible'; } });
         msg.textContent = st.message || '';

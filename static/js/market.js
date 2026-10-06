@@ -74,7 +74,7 @@ async function pollSnapshot() {
 
 export function startPolling() {
   stopPolling();
-  const qMs = isBroker() ? 1500 : 5000;
+  const qMs = isBroker() ? 1500 : 3000;
   pollQuotes(); pollSnapshot();
   quoteTimer = setInterval(pollQuotes, qMs);
   snapTimer = setInterval(pollSnapshot, 2000);
