@@ -24,8 +24,8 @@ http.createServer((req, res) => {
   if (p === '/api/market/symbols') return json(res, { symbols: syms.map(([symbol, description, category, digits]) => ({ symbol, description, category, digits, minVolume: 0.01, maxVolume: 100, volumeStep: 0.01, contractSize: 100000 })) });
   if (p === '/api/brokers/popular') return json(res, { brokers: { Exness: ['Exness-MT5Real8', 'Exness-MT5Trial9'], 'IC Markets': ['ICMarketsSC-Demo'] } });
   if (p === '/api/brokers/search') return json(res, { brokers: { Exness: ['Exness-MT5Real8'] } });
-  if (p === '/api/auth/connect' && req.method === 'POST') return json(res, { job: 'j1' }, 202);
-  if (p === '/api/auth/connect/j1') return json(res, { state: 'ready', token: 'tok', account });
+  if (p === '/api/auth/connect' && req.method === 'POST') return json(res, { job: 'j1', poll: 'pk1' }, 202);
+  if (p === '/api/auth/connect/j1') return req.headers['x-poll-key'] === 'pk1' ? json(res, { state: 'ready', token: 'tok', account }) : json(res, { error: 'Unknown connection attempt.', code: 'not_found' }, 404);
   if (p === '/api/trading/snapshot') return json(res, { account, positions: pos, orders: [] });
   if (p === '/api/trading/history') return json(res, { deals: [{ kind: 'deal', entry: 'out', time: Date.now() / 1000 - 86400, profit: 42, symbol: 'EURUSD', side: 'buy', volume: .1, price: 1.08 }] });
   if (p === '/api/news') return json(res, { sources: { cnbc: 'CNBC Markets' }, articles: [{ title: 'Markets rally', summary: 'Stocks rose.', url: 'https://example.com', source: 'CNBC Markets', time: Date.now() / 1000 - 600 }] });
