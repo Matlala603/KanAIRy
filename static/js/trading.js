@@ -126,11 +126,37 @@ export function mountTicket(root) {
         okText: `${side === 'buy' ? 'Buy' : 'Sell'} ${S.symbol}`, details: h('div', { class: 'info' }, rows.map(([k, v]) => h('div', {}, h('span', {}, k), h('b', {}, v)))) });
       if (!ok) return;
     }
-    try {
-      const r = await api.order(body);
+    // One id per order the user confirms. The server answers a repeat of the same id from the first result,
+    // so a slow or lost reply can never become a second position.
+    body.clientOrderId = newOrderId();
+    const done = r => {
       toast(`${r.message || 'Order accepted'}${r.positionId ? ' · #' + r.positionId : ''}`, 'ok'); refreshNow();
       if (T.type !== 'market') hooks.showScreen('positions');
-    } catch (e) { err.textContent = e.message; toast(e.message, 'error'); }
+    };
+    try { done(await api.order(body)); }
+    catch (e) {
+      // No reply, a timeout or "could not confirm" does NOT mean the order failed: find out before saying anything.
+      if (e.status === 0 || e.status === 504 || e.code === 'order_unknown') {
+        err.textContent = 'Checking whether your order went through…';
+        const st = await settleOrder(body.clientOrderId);
+        if (st === 'executed' || st === 'working') { err.textContent = ''; toast('Your order went through. Check Positions.', 'ok'); refreshNow(); if (T.type !== 'market') hooks.showScreen('positions'); return; }
+        if (st === 'not_executed') { err.textContent = 'The order was not placed.'; toast('The order was not placed.', 'error'); return; }
+        err.textContent = 'We could not confirm this order. Check Positions and Orders before sending it again.';
+        toast(err.textContent, 'error'); refreshNow(); return;
+      }
+      err.textContent = e.message; toast(e.message, 'error');
+    }
+  }
+  const newOrderId = () => (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : (Date.now().toString(36) + Math.random().toString(36).slice(2))).slice(0, 20);
+  async function settleOrder(id) {
+    for (let i = 0; i < 4; i++) {
+      await new Promise(r => setTimeout(r, i === 0 ? 1500 : 3000));
+      try {
+        const { status } = await api.orderStatus(id);
+        if (['executed', 'working', 'not_executed'].includes(status)) return status;
+      } catch { /* try again */ }
+    }
+    return 'unknown';
   }
 
   hooks.openTicket = ({ side, type, price } = {}) => {

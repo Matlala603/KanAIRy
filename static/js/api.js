@@ -10,7 +10,7 @@ let onUnauth = () => {};
 export const setToken = t => { token = t; };
 export const onUnauthenticated = fn => { onUnauth = fn; };
 
-async function call(method, path, { body, query, signal, auth = true, timeout = 25000 } = {}) {
+async function call(method, path, { body, query, signal, auth = true, timeout = 25000, headers } = {}) {
   const url = new URL(path, location.origin);
   if (query) Object.entries(query).forEach(([k, v]) => { if (v != null && v !== '') url.searchParams.set(k, v); });
   const ctl = new AbortController();
@@ -20,7 +20,7 @@ async function call(method, path, { body, query, signal, auth = true, timeout = 
   try {
     res = await fetch(url, {
       method, signal: ctl.signal,
-      headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(auth && token ? { Authorization: 'Bearer ' + token } : {}) },
+      headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(auth && token ? { Authorization: 'Bearer ' + token } : {}), ...(headers || {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
@@ -42,7 +42,7 @@ export const api = {
   brokersPopular: platform => get('/api/brokers/popular', { query: { platform }, auth: false, timeout: 60000 }),
   brokersSearch: (q, platform, signal) => get('/api/brokers/search', { query: { q, platform }, auth: false, signal }),
   connect: body => call('POST', '/api/auth/connect', { body, auth: false }),
-  connectStatus: job => get('/api/auth/connect/' + job, { auth: false }),
+  connectStatus: (job, poll) => get('/api/auth/connect/' + job, { auth: false, headers: { 'X-Poll-Key': poll || '' } }),
   me: () => get('/api/auth/me'),
   logout: () => call('POST', '/api/auth/logout'),
   symbols: () => get('/api/market/symbols', { timeout: 60000 }),
@@ -51,6 +51,7 @@ export const api = {
   snapshot: signal => get('/api/trading/snapshot', { signal }),
   history: days => get('/api/trading/history', { query: { days }, timeout: 40000 }),
   order: body => call('POST', '/api/trading/order', { body, timeout: 40000 }),
+  orderStatus: id => get('/api/trading/order-status/' + encodeURIComponent(id), { timeout: 15000 }),
   closePosition: (id, volume) => call('POST', `/api/trading/positions/${encodeURIComponent(id)}/close`, { body: volume ? { volume } : {}, timeout: 40000 }),
   modifyPosition: (id, body) => call('PATCH', `/api/trading/positions/${encodeURIComponent(id)}`, { body, timeout: 40000 }),
   modifyOrder: (id, body) => call('PATCH', `/api/trading/orders/${encodeURIComponent(id)}`, { body, timeout: 40000 }),
