@@ -131,7 +131,7 @@ class PublicData:
             raise PublicError(400, "Unsupported timeframe")
         interval, rng, factor = YAHOO_TF[timeframe]
         ck = f"c:{symbol}:{timeframe}"
-        ttl = 20 if timeframe in ("M1", "M5") else 45
+        ttl = 8 if timeframe in ("M1", "M5", "M15") else 20
         rows = self.cache.get(ck, ttl)
         if rows is None:
             try:
@@ -162,7 +162,7 @@ class PublicData:
         if not inst:
             return None
         ck = f"q:{symbol}"
-        hit = self.cache.get(ck, 5)
+        hit = self.cache.get(ck, 3)
         if hit:
             return hit
         try:
