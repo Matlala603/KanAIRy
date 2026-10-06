@@ -142,6 +142,7 @@ class BrokerSession:
         self.spec_cache: Dict[str, Dict[str, Any]] = {}
         self.last_used = time.time()
         self.lock = asyncio.Lock()
+        self.idem: Dict[str, Dict[str, Any]] = {}   # clientOrderId -> {"task", "state", "result", "ts"}
 
     # ----- state read from the synchronized terminal (no network) -----
     def _state(self):
@@ -361,7 +362,107 @@ class BrokerSession:
         return out
 
     # ----- trading -----
+    # ----- idempotent order submission -----
+    # A timeout does not mean the order failed. Every order carries a client-generated id that is also sent to the
+    # broker gateway as the order's clientId, so a repeat of the same request is answered from the first result,
+    # and an unclear outcome is settled by looking the order up instead of guessing.
+    def _prune_idem(self):
+        cutoff = time.time() - 6 * 3600
+        for k in [k for k, v in self.idem.items() if v["ts"] < cutoff and v["task"].done()]:
+            self.idem.pop(k, None)
+
+    async def _raw_lists(self):
+        pos = ords = None
+        try:
+            pos, ords = self._state().positions, self._state().orders
+        except Exception:
+            pos = ords = None
+        if pos is None:
+            pos = await self.conn.get_positions()
+        if ords is None:
+            ords = await self.conn.get_orders()
+        return list(pos or []), list(ords or [])
+
+    async def find_by_client_id(self, cid: str) -> Optional[Dict[str, Any]]:
+        """Look for an order we sent: open positions, working orders, then recent history."""
+        pos, ords = await self._raw_lists()
+        for p in pos:
+            if p.get("clientId") == cid:
+                return {"status": "executed", "positionId": str(p.get("id", "")), "orderId": str(p.get("id", ""))}
+        for o in ords:
+            if o.get("clientId") == cid:
+                return {"status": "working", "orderId": str(o.get("id", "")), "positionId": ""}
+        try:
+            end = datetime.now(timezone.utc) + timedelta(minutes=5)
+            res = await self.conn.get_history_orders_by_time_range(end - timedelta(hours=6), end)
+            for o in (res or {}).get("historyOrders", []) or []:
+                if o.get("clientId") == cid:
+                    filled = str(o.get("state", "")).endswith(("FILLED", "PARTIALLY_FILLED"))
+                    return {"status": "executed" if filled else "not_executed", "orderId": str(o.get("id", "")),
+                            "positionId": str(o.get("positionId", ""))}
+        except Exception:  # noqa: BLE001 - history is a best-effort second look
+            pass
+        return None
+
+    async def order_status(self, cid: str) -> Dict[str, Any]:
+        entry = self.idem.get(cid)
+        if entry and not entry["task"].done():
+            return {"status": "submitting"}
+        found = await self.find_by_client_id(cid)
+        if found:
+            return found
+        if entry and entry["state"] == "rejected":
+            return {"status": "not_executed", "message": entry.get("message", "")}
+        return {"status": "not_found" if entry is None else "unknown"}
+
     async def place_order(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        cid = req.get("clientOrderId")
+        if not cid:
+            return await self._place_order_raw(req, None)
+        self._prune_idem()
+        entry = self.idem.get(cid)
+        if entry is not None:
+            if not entry["task"].done():                       # same request still running: share its outcome
+                return await asyncio.shield(entry["task"])
+            if entry["state"] == "ok":                         # already done: return the first result
+                return {**entry["result"], "duplicate": True}
+            found = await self.find_by_client_id(cid)          # earlier attempt was unclear: settle it first
+            if found and found["status"] in ("executed", "working"):
+                res = {"ok": True, "orderId": found.get("orderId", ""), "positionId": found.get("positionId", ""),
+                       "message": "Order was already placed", "duplicate": True}
+                entry.update(state="ok", result=res)
+                return res
+            if entry["state"] == "unknown":
+                raise ApiError(409, "The earlier attempt of this order could not be confirmed. Check Positions and Orders before sending it again.", "order_unknown")
+        task = asyncio.ensure_future(self._place_order_raw(req, cid))
+        entry = {"task": task, "state": "pending", "result": None, "ts": time.time()}
+        self.idem[cid] = entry
+        try:
+            res = await asyncio.shield(task)
+        except asyncio.CancelledError:                         # the client went away: let the order finish, keep the record
+            raise
+        except Exception as e:  # noqa: BLE001
+            err = explain_error(e)
+            unclear = err.status in (502, 503, 504) or err.code in ("timeout", "upstream_error")
+            if not unclear:                                    # a definite refusal: nothing was placed
+                entry.update(state="rejected", message=err.message)
+                raise err
+            entry["state"] = "unknown"
+            found = None
+            try:
+                found = await self.find_by_client_id(cid)
+            except Exception:  # noqa: BLE001
+                pass
+            if found and found["status"] in ("executed", "working"):
+                res = {"ok": True, "orderId": found.get("orderId", ""), "positionId": found.get("positionId", ""),
+                       "message": "Order placed (confirmed after a slow reply)", "reconciled": True}
+                entry.update(state="ok", result=res)
+                return res
+            raise ApiError(504, "We could not confirm whether this order reached your broker. Check Positions and Orders before trying again.", "order_unknown")
+        entry.update(state="ok", result=res)
+        return res
+
+    async def _place_order_raw(self, req: Dict[str, Any], cid: Optional[str]) -> Dict[str, Any]:
         symbol = req["symbol"]
         side = req["side"]
         otype = req["type"]
@@ -394,7 +495,14 @@ class BrokerSession:
             raise ApiError(400, "A price is required for pending orders")
         if otype == "stop_limit" and not limit_price:
             raise ApiError(400, "A stop-limit price is required for stop-limit orders")
+        if otype != "market":  # entry price is known, so the stop direction can be checked before the broker sees it
+            if sl and (sl >= price if side == "buy" else sl <= price):
+                raise ApiError(400, "For a buy the stop loss must be below the entry price." if side == "buy" else "For a sell the stop loss must be above the entry price.", "validation")
+            if tp and (tp <= price if side == "buy" else tp >= price):
+                raise ApiError(400, "For a buy the take profit must be above the entry price." if side == "buy" else "For a sell the take profit must be below the entry price.", "validation")
         opts = {"comment": (req.get("comment") or "KanAIRY")[:26]}
+        if cid:
+            opts["clientId"] = cid
         c = self.conn
         if otype == "market":
             fn = c.create_market_buy_order if side == "buy" else c.create_market_sell_order
@@ -536,6 +644,34 @@ class BrokerManager:
                 return a
         return None
 
+    async def _wait_broker(self, job_id: str, account: Any, limit: int = 150):
+        """Wait for the terminal to sign in to the broker, reporting progress and failing early with a clear reason.
+
+        MetaApi reports DISCONNECTED while the terminal starts and DISCONNECTED_FROM_BROKER once the terminal is up
+        but the broker is not accepting the login. A terminal that stays disconnected from the broker is almost
+        always a wrong password, wrong server name or a broker that blocks the gateway.
+        """
+        start = time.time()
+        stuck_since = None
+        while True:
+            await account.reload()
+            status = str(getattr(account, "connection_status", "") or "")
+            replicas = [str(getattr(r, "connection_status", "") or "") for r in getattr(account, "replicas", []) or []]
+            if "CONNECTED" in [status] + replicas:
+                return
+            waited = int(time.time() - start)
+            if status == "DISCONNECTED_FROM_BROKER":
+                stuck_since = stuck_since or time.time()
+                self._set(job_id, "connecting", f"Your terminal is running but the broker has not accepted the login yet ({waited}s)")
+                if time.time() - stuck_since > 75:
+                    raise ApiError(401, "The broker did not accept this login. Check the account number, the trading password (not the investor password) and that the server name matches your MetaTrader terminal exactly.", "bad_credentials")
+            else:
+                stuck_since = None
+                self._set(job_id, "connecting", f"Starting your terminal ({waited}s)")
+            if waited > limit:
+                raise ApiError(504, "The broker did not answer in time. Check the server name and password, then try again.", "timeout")
+            await asyncio.sleep(2)
+
     async def _open(self, account: Any, wait_seconds: int = 240):
         if getattr(account, "state", None) not in ("DEPLOYED", "DEPLOYING"):
             await account.deploy()
@@ -561,9 +697,12 @@ class BrokerManager:
         for jid in [j for j, v in self.jobs.items() if time.time() - v.get("updated", 0) > 1800]:
             self.jobs.pop(jid, None)
         job_id = uuid.uuid4().hex
-        self._set(job_id, "queued", "Starting")
+        # The job id appears in URLs and server logs, so it must not be enough to collect the session token.
+        # The caller also gets a secret poll key (never logged: it travels in a header); only its hash is kept.
+        poll_key = secrets.token_urlsafe(24)
+        self._set(job_id, "queued", "Starting", poll_hash=hashlib.sha256(poll_key.encode()).hexdigest())
         asyncio.create_task(self._connect_job(job_id, str(login).strip(), password, server.strip(), platform, broker_name, on_ready))
-        return job_id
+        return job_id, poll_key
 
     async def _connect_job(self, job_id, login, password, server, platform, broker_name, on_ready):
         try:
@@ -594,11 +733,11 @@ class BrokerManager:
             if getattr(account, "state", None) not in ("DEPLOYED", "DEPLOYING"):
                 await account.deploy()
             self._set(job_id, "connecting", "Signing in to the broker")
-            await account.wait_connected(300)
+            await self._wait_broker(job_id, account)
             self._set(job_id, "syncing", "Synchronising positions and prices")
             conn = account.get_streaming_connection()
             await conn.connect()
-            await conn.wait_synchronized({"timeoutInSeconds": 300})
+            await conn.wait_synchronized({"timeoutInSeconds": 120})
             session = BrokerSession(key, account, conn, {
                 "login": login, "server": server, "platform": platform, "broker_name": broker_name,
             })
@@ -610,11 +749,21 @@ class BrokerManager:
             err = explain_error(e)
             self._set(job_id, "failed", err.message, code=err.code)
 
-    def job(self, job_id: str) -> Dict[str, Any]:
+    def job(self, job_id: str, poll_key: str = "") -> Dict[str, Any]:
         job = self.jobs.get(job_id)
-        if not job:
+        good = bool(job) and bool(poll_key) and hmac.compare_digest(
+            hashlib.sha256(str(poll_key).encode()).hexdigest(), str(job.get("poll_hash", "")))
+        if not good:  # same answer for "no such job" and "wrong key", so ids cannot be probed
             raise ApiError(404, "Unknown connection attempt.", "not_found")
-        return {k: v for k, v in job.items() if k != "updated"}
+        out = {k: v for k, v in job.items() if k not in ("updated", "poll_hash", "delivered")}
+        if job.get("state") == "ready":
+            if job.get("delivered"):
+                out.pop("token", None)
+                out["message"] = "Already collected"
+            else:  # the session token is handed over exactly once
+                job["delivered"] = True
+                job.pop("token", None)
+        return out
 
     async def session_for(self, claims: Dict[str, Any]) -> BrokerSession:
         key = self.key(claims["login"], claims["server"])
