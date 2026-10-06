@@ -91,7 +91,7 @@ async def session_dep(claims: dict = Depends(claims_dep)):
 _attempts = defaultdict(deque)
 
 
-def _limit(ip: str, limit: int = 8, window: int = 300):
+def _limit(ip: str, limit: int = 8, window: int = 300, what: str = "connection attempts"):
     q = _attempts[ip]
     now = time.time()
     if len(_attempts) > 5000:
@@ -100,7 +100,7 @@ def _limit(ip: str, limit: int = 8, window: int = 300):
     while q and now - q[0] > window:
         q.popleft()
     if len(q) >= limit:
-        raise ApiError(429, "Too many connection attempts. Wait a few minutes and try again.", "rate_limited")
+        raise ApiError(429, f"Too many {what}. Wait a moment and try again.", "rate_limited")
     q.append(now)
 
 
@@ -132,14 +132,14 @@ async def _on_ready(session, info):
 async def connect(body: ConnectRequest, request: Request):
     _limit(request.client.host if request.client else "unknown")
     _limit("login:" + body.login.strip() + "|" + body.server.strip().lower(), limit=6, window=900)
-    job = await get_manager().start_connect(body.login, body.password, body.server, body.platform,
-                                            body.broker_name, _on_ready)
-    return {"job": job}
+    job, poll = await get_manager().start_connect(body.login, body.password, body.server, body.platform,
+                                                  body.broker_name, _on_ready)
+    return {"job": job, "poll": poll}
 
 
 @app.get("/api/auth/connect/{job}")
-async def connect_status(job: str):
-    return get_manager().job(job)
+async def connect_status(job: str, x_poll_key: str = Header("")):
+    return get_manager().job(job, x_poll_key)
 
 
 @app.get("/api/auth/me")
@@ -185,21 +185,31 @@ async def history(days: int = Query(30, ge=1, le=365), session=Depends(session_d
 
 @app.post("/api/trading/order")
 async def place_order(body: OrderRequest, session=Depends(session_dep)):
+    _limit("order:" + session.key, limit=20, window=60, what="orders")
     return await session.place_order(body.model_dump())
+
+
+@app.get("/api/trading/order-status/{client_id}")
+async def order_status(client_id: str, session=Depends(session_dep)):
+    _limit("ostat:" + session.key, limit=60, window=60, what="status checks")
+    return await session.order_status(client_id)
 
 
 @app.post("/api/trading/positions/{position_id}/close")
 async def close_position(position_id: str, body: ClosePositionRequest, session=Depends(session_dep)):
+    _limit("mod:" + session.key, limit=60, window=60, what="trade changes")
     return await session.close_position(position_id, body.volume)
 
 
 @app.patch("/api/trading/positions/{position_id}")
 async def modify_position(position_id: str, body: ModifyRequest, session=Depends(session_dep)):
+    _limit("mod:" + session.key, limit=60, window=60, what="trade changes")
     return await session.modify_position(position_id, body.stopLoss, body.takeProfit)
 
 
 @app.patch("/api/trading/orders/{order_id}")
 async def modify_order(order_id: str, body: ModifyRequest, session=Depends(session_dep)):
+    _limit("mod:" + session.key, limit=60, window=60, what="trade changes")
     if not body.price:
         raise ApiError(400, "A price is required")
     return await session.modify_order(order_id, body.price, body.stopLoss, body.takeProfit)
@@ -207,6 +217,7 @@ async def modify_order(order_id: str, body: ModifyRequest, session=Depends(sessi
 
 @app.delete("/api/trading/orders/{order_id}")
 async def cancel_order(order_id: str, session=Depends(session_dep)):
+    _limit("mod:" + session.key, limit=60, window=60, what="trade changes")
     return await session.cancel_order(order_id)
 
 

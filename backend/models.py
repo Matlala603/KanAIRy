@@ -22,6 +22,7 @@ class OrderRequest(BaseModel):
     stopLoss: Optional[float] = Field(None, gt=0)
     takeProfit: Optional[float] = Field(None, gt=0)
     comment: Optional[str] = Field(None, max_length=26)
+    clientOrderId: Optional[str] = Field(None, min_length=8, max_length=20, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class ClosePositionRequest(BaseModel):
