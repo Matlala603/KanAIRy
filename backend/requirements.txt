@@ -3,4 +3,4 @@ uvicorn[standard]>=0.29
 httpx>=0.25
 python-dotenv>=1.0
 pydantic>=2.5
-metaapi-cloud-sdk==22.1.0
+metaapi-cloud-sdk==29.1.1
