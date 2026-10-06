@@ -5,6 +5,7 @@ any MetaTrader 4/5 broker) plus public market data, news and the economic
 calendar. Every account/trading route requires a signed session token.
 """
 import asyncio
+import logging
 import os
 import sys
 import time
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
 
 from fastapi import Depends, FastAPI, Header, Query, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
