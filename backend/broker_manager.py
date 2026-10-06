@@ -88,25 +88,27 @@ def explain_error(exc: Exception) -> ApiError:
     text = str(exc) or exc.__class__.__name__
     name = exc.__class__.__name__
     low = text.lower()
-    if "e_auth" in low or "authorization" in low or "invalid account" in low or "wrong password" in low:
+    # Exception class first: a refused MetaApi *token* also says "authorization", and must not be reported as a bad
+    # broker password.
+    if name in ("ForbiddenException", "UnauthorizedException"):
+        return ApiError(502, "The MetaApi token was refused or lacks permission (or the MetaApi account limit was reached). The server operator needs to check METAAPI_TOKEN and the MetaApi plan.", "metaapi_auth")
+    if name in ("TooManyRequestsException",) or "too many requests" in low:
+        return ApiError(429, "Too many requests to the broker gateway. Wait a moment and try again.", "rate_limited")
+    if name in ("TimeoutException",) or isinstance(exc, asyncio.TimeoutError) or "timed out" in low:
+        return ApiError(504, "The broker did not answer in time. Try again.", "timeout")
+    if name in ("ValidationException",):
+        # never echo upstream details: they can contain the submitted payload
+        return ApiError(400, "The broker gateway rejected those account details. Check the account number, server and platform.", "validation")
+    if name in ("NotFoundException",):
+        return ApiError(404, text, "not_found")
+    if "e_auth" in low or "invalid account" in low or "wrong password" in low:
         return ApiError(401, "The broker rejected these credentials. Check the account number, password and server.", "bad_credentials")
-    if "e_server_timezone" in low or "e_resolve_host" in low or "server" in low and "not found" in low:
+    if "e_server_timezone" in low or "e_resolve_host" in low or ("server" in low and "not found" in low):
         return ApiError(400, "The broker server could not be found. Pick the server from the list or copy it exactly from your MetaTrader terminal.", "bad_server")
     if name == "TradeException" or hasattr(exc, "string_code"):
         code = getattr(exc, "string_code", "") or ""
         msg = getattr(exc, "message", None) or text
         return ApiError(400, f"Broker refused the order: {msg}", code or "trade_rejected")
-    if name in ("TooManyRequestsException",) or "too many requests" in low:
-        return ApiError(429, "Too many requests to the broker gateway. Wait a moment and try again.", "rate_limited")
-    if name in ("TimeoutException",) or isinstance(exc, asyncio.TimeoutError) or "timed out" in low:
-        return ApiError(504, "The broker did not answer in time. Try again.", "timeout")
-    if name in ("NotFoundException",):
-        return ApiError(404, text, "not_found")
-    if name in ("ValidationException",):
-        # never echo upstream details: they can contain the submitted payload
-        return ApiError(400, "The broker gateway rejected those account details. Check the account number, server and platform.", "validation")
-    if name in ("ForbiddenException", "UnauthorizedException"):
-        return ApiError(502, "The MetaApi token was refused. The server operator needs to check METAAPI_TOKEN.", "metaapi_auth")
     # log the exception type, its message (for KeyError this is the missing key) and the traceback,
     # so the failing line is visible in the server logs; nothing here is returned to the client
     logging.getLogger("kanairy").warning("upstream error: %s: %r", name, exc, exc_info=exc)
@@ -747,6 +749,9 @@ class BrokerManager:
             self._set(job_id, "ready", "Connected", token=token, account=info)
         except Exception as e:  # noqa: BLE001
             err = explain_error(e)
+            detail = str(e).replace(password, "***") if password else str(e)
+            logging.getLogger("kanairy").warning("connect failed: login=%s server=%s platform=%s -> %s (%s) | %s: %s",
+                                                 login, server, platform, err.code, err.status, type(e).__name__, detail[:300])
             self._set(job_id, "failed", err.message, code=err.code)
 
     def job(self, job_id: str, poll_key: str = "") -> Dict[str, Any]:
