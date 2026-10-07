@@ -717,7 +717,21 @@ class BrokerManager:
                 meta = getattr(account, "metadata", None)
                 proof = meta.get("kanairy") if isinstance(meta, dict) else None
                 if not check_proof(password, proof):
-                    raise ApiError(401, "That password does not match the one this account was linked with here, or the account was linked elsewhere. Nothing was changed.", "bad_credentials")
+                    # A live, signed-in account belongs to whoever linked it: refuse. But an account that is NOT
+                    # connected to the broker never worked (typically the first attempt had a mistyped password
+                    # and that wrong password got stored as the proof). Locking the user out of it forever is the
+                    # bug; re-link it with the new password, and the broker check below proves it is correct.
+                    if str(getattr(account, "connection_status", "") or "") == "CONNECTED":
+                        raise ApiError(401, "That password does not match the one this account was linked with here, or the account was linked elsewhere. Nothing was changed.", "bad_credentials")
+                    self._set(job_id, "provisioning", "Updating your saved login")
+                    await account.update({
+                        "name": f"KanAIRY {login}",
+                        "password": password,
+                        "server": server,
+                        "magic": 0,
+                        "metadata": {"kanairy": make_proof(password)},
+                    })
+                    await account.redeploy()
             if account is None:
                 self._set(job_id, "provisioning", "Registering your account with the broker gateway")
                 account = await self.api.metatrader_account_api.create_account({
