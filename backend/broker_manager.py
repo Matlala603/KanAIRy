@@ -1,473 +1,430 @@
-"""MetaApi broker manager.
+"""MetaRPC (mrpc.pro) broker manager: drop-in alternative to the MetaApi BrokerManager.
 
-Owns every live connection to a MetaTrader account (MT4 or MT5) through
-MetaApi, and exposes a small async surface the HTTP layer can call:
-account snapshot, quotes, candles, positions, orders, history and trading.
+How it differs from MetaApi (read this before deploying)
+- MetaRPC has no stored-account object. Every terminal is started with ConnectEx(login, password, server) and
+  stopped with Disconnect. So the server keeps the MT password IN MEMORY ONLY (never on disk, never in the session
+  token, never logged) for as long as the account is in use, which lets an idle terminal be shut down and started
+  again on the next request. A server restart, a logout, or CRED_TTL_SECONDS without use wipes it and the user
+  has to connect again.
+- Idle protection: a session nobody touched for MRPC_IDLE_SECONDS (default 600) is disconnected (terminal stopped).
+  Short TTL caches also cut the number of calls the 1-2 second browser polling would otherwise make.
 
-Design notes
-- One streaming connection per (login, server). Account info, positions,
-  orders and prices are read from the connection's synchronized terminal
-  state, so polling them costs nothing on the wire.
-- Connecting a brand-new account can take minutes (provision, deploy, broker
-  login, first sync). It runs as a background job the client polls, which keeps
-  every HTTP request short (Heroku-style 30s router limits).
-- Sessions are re-attached lazily after a restart: the MetaApi account already
-  exists, so no password is needed and none is stored by KanAIRY.
+Endpoint status
+- VERIFIED in MetaRPC's public docs: host per platform, `APIKey` header, ConnectEx, Disconnect, the `id` header
+  (terminal session id), and that AccountSummary and OrderSend exist.
+- NOT VERIFIED: every other path / parameter / response field below (they follow the naming of the sibling MT REST
+  APIs). They are all isolated in EP / the *_params helpers / the normalisers so a mismatch is a one-line fix.
+  Run `python3 scripts/mrpc_probe.py` against a demo account first; it shows which calls work and their real shape.
 """
 import asyncio
-import base64
-import hashlib
-import hmac
+import json
 import logging
+import os
 import re
-import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
-PROVISIONING_HOST = "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai"
+from broker_manager import (ApiError, BrokerManager, BrokerSession, ORDER_TYPES, TF_SECONDS, _epoch, _num,
+                            explain_error)
 
-POPULAR_BROKERS = [
-    "IC Markets", "Exness", "XM", "Pepperstone", "FBS", "HFM", "Tickmill",
-    "FXTM", "Admirals", "Vantage", "OANDA", "Equiti", "FTMO", "AvaTrade",
-    "Octa", "RoboForex", "FP Markets", "Eightcap", "Deriv", "Alpari",
-    "Axi", "BlackBull", "FXPro", "Capital.com", "Standard Bank", "Mex Atlantic",
-]
+# The password travels in ConnectEx's query string, and httpx logs every request URL at INFO. Silence that.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+log = logging.getLogger("kanairy.mrpc")
 
-TIMEFRAMES = {
-    "M1": "1m", "M5": "5m", "M15": "15m", "M30": "30m",
-    "H1": "1h", "H4": "4h", "D1": "1d", "W1": "1w", "MN": "1mn",
+HOSTS = {"mt4": "https://mt4.mrpc.pro", "mt5": "https://mt5.mrpc.pro"}
+
+# ---------------------------------------------------------------- endpoint table
+EP = {
+    "connect": "/ConnectEx",            # VERIFIED
+    "disconnect": "/Disconnect",        # VERIFIED
+    "account": "/AccountSummary",       # name VERIFIED, response fields not
+    "opened": "/OpenedOrders",          # unverified
+    "history": "/OrderHistory",         # unverified
+    "symbols": "/Symbols",              # unverified
+    "symbol_params": "/SymbolParams",   # unverified
+    "quote": "/GetQuote",               # unverified
+    "candles": "/PriceHistory",         # unverified
+    "send": "/OrderSend",               # name VERIFIED, params not
+    "close": "/OrderClose",             # unverified (also used to cancel a pending order)
+    "modify": "/OrderModify",           # unverified
 }
-TF_SECONDS = {
-    "M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600,
-    "H4": 14400, "D1": 86400, "W1": 604800, "MN": 2592000,
-}
+TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440, "W1": 10080, "MN": 43200}
 
-ORDER_TYPES = {"market", "limit", "stop", "stop_limit"}
+OP_BY_INT = {0: "buy", 1: "sell", 2: "buylimit", 3: "selllimit", 4: "buystop", 5: "sellstop",
+             6: "buystoplimit", 7: "sellstoplimit"}
+OPERATION = {("buy", "market"): "Buy", ("sell", "market"): "Sell", ("buy", "limit"): "BuyLimit",
+             ("sell", "limit"): "SellLimit", ("buy", "stop"): "BuyStop", ("sell", "stop"): "SellStop",
+             ("buy", "stop_limit"): "BuyStopLimit", ("sell", "stop_limit"): "SellStopLimit"}
+BALANCE_TYPES = {"balance", "credit", "charge", "correction", "bonus", "deposit", "withdrawal"}
+BAD_LOGIN = re.compile(r"password|invalid account|invalid login|authori[sz]|wrong|denied|incorrect|not found.*server|"
+                       r"no connection|invalid.*server|account.*disabled", re.I)
+SESSION_GONE = re.compile(r"not connected|no such (terminal|session)|unknown (id|terminal|session)|terminal.*(not|stopped)|"
+                          r"session.*(expired|not found)|invalid id", re.I)
+CID_TAG = "kr:"
 
 
-class ApiError(Exception):
-    def __init__(self, status: int, message: str, code: str = "error"):
+class MrpcError(Exception):
+    def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
         self.message = message
-        self.code = code
 
 
-def _epoch(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return int(value.timestamp())
-    return None
-
-
-def _num(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
+# ---------------------------------------------------------------- tolerant readers
+def _g(d: Any, *names: str, default: Any = None) -> Any:
+    """Case-insensitive first-match field read."""
+    if not isinstance(d, dict):
         return default
+    low = {str(k).lower(): v for k, v in d.items()}
+    for n in names:
+        v = low.get(n.lower())
+        if v is not None:
+            return v
+    return default
 
 
-def explain_error(exc: Exception) -> ApiError:
-    """Turn a MetaApi / network exception into a message a trader can act on."""
-    if isinstance(exc, ApiError):
-        return exc
-    text = str(exc) or exc.__class__.__name__
-    name = exc.__class__.__name__
-    low = text.lower()
-    # Exception class first: a refused MetaApi *token* also says "authorization", and must not be reported as a bad
-    # broker password.
-    if name in ("ForbiddenException", "UnauthorizedException"):
-        return ApiError(502, "The MetaApi token was refused or lacks permission (or the MetaApi account limit was reached). The server operator needs to check METAAPI_TOKEN and the MetaApi plan.", "metaapi_auth")
-    if name in ("TooManyRequestsException",) or "too many requests" in low:
-        return ApiError(429, "Too many requests to the broker gateway. Wait a moment and try again.", "rate_limited")
-    if name in ("TimeoutException",) or isinstance(exc, asyncio.TimeoutError) or "timed out" in low:
-        return ApiError(504, "The broker did not answer in time. Try again.", "timeout")
-    if name in ("ValidationException",):
-        # never echo upstream details: they can contain the submitted payload
-        return ApiError(400, "The broker gateway rejected those account details. Check the account number, server and platform.", "validation")
-    if name in ("NotFoundException",):
-        return ApiError(404, text, "not_found")
-    if "e_auth" in low or "invalid account" in low or "wrong password" in low:
-        return ApiError(401, "The broker rejected these credentials. Check the account number, password and server.", "bad_credentials")
-    if "e_server_timezone" in low or "e_resolve_host" in low or ("server" in low and "not found" in low):
-        return ApiError(400, "The broker server could not be found. Pick the server from the list or copy it exactly from your MetaTrader terminal.", "bad_server")
-    if name == "TradeException" or hasattr(exc, "string_code"):
-        code = getattr(exc, "string_code", "") or ""
-        msg = getattr(exc, "message", None) or text
-        return ApiError(400, f"Broker refused the order: {msg}", code or "trade_rejected")
-    # log the exception type, its message (for KeyError this is the missing key) and the traceback,
-    # so the failing line is visible in the server logs; nothing here is returned to the client
-    logging.getLogger("kanairy").warning("upstream error: %s: %r", name, exc, exc_info=exc)
-    return ApiError(502, "The broker gateway returned an error. Try again in a moment.", "upstream_error")
+def _unwrap(res: Any) -> Any:
+    for _ in range(3):
+        if isinstance(res, dict):
+            inner = _g(res, "result", "data", "value", "items")
+            if inner is not None and len(res) <= 3:
+                res = inner
+                continue
+        break
+    return res
 
 
-def make_proof(password: str) -> Dict[str, Any]:
-    """Salted scrypt hash stored in the MetaApi account metadata, so a later connect can prove it knows the password."""
-    salt = secrets.token_bytes(16)
-    h = hashlib.scrypt(password.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
-    return {"v": 1, "salt": base64.b64encode(salt).decode(), "hash": base64.b64encode(h).decode()}
+def _rows(res: Any, *keys: str) -> List[Dict[str, Any]]:
+    res = _unwrap(res)
+    if isinstance(res, dict):
+        res = _g(res, *keys, default=[]) if keys else []
+    return [r for r in (res or []) if isinstance(r, dict)]
 
 
-def check_proof(password: str, proof: Any) -> bool:
-    try:
-        if not isinstance(proof, dict) or proof.get("v") != 1:
-            return False
-        salt = base64.b64decode(proof["salt"])
-        want = base64.b64decode(proof["hash"])
-        got = hashlib.scrypt(password.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
-        return hmac.compare_digest(got, want)
-    except Exception:  # noqa: BLE001
-        return False
+def _flat(res: Any) -> Dict[str, Any]:
+    """AccountSummary as one flat dict, whether the gateway wraps it in a list / result / nested object."""
+    res = _unwrap(res)
+    if isinstance(res, list):
+        res = res[0] if res and isinstance(res[0], dict) else {}
+    if not isinstance(res, dict):
+        return {}
+    out = dict(res)
+    for v in res.values():
+        if isinstance(v, dict):
+            for k, x in v.items():
+                out.setdefault(k, x)
+    return out
 
 
-class BrokerSession:
-    def __init__(self, key: str, account: Any, connection: Any, info: Dict[str, Any]):
-        self.key = key
-        self.account = account
-        self.conn = connection
-        self.info = info                      # login, server, platform, broker
-        self.subscribed: set = set()
-        self.spec_cache: Dict[str, Dict[str, Any]] = {}
-        self.last_used = time.time()
-        self.lock = asyncio.Lock()
-        self.idem: Dict[str, Dict[str, Any]] = {}   # clientOrderId -> {"task", "state", "result", "ts"}
+def _optype(v: Any) -> str:
+    """Normalise any order-type spelling to e.g. 'buylimit'."""
+    if isinstance(v, (int, float)) and int(v) in OP_BY_INT:
+        return OP_BY_INT[int(v)]
+    s = re.sub(r"[^a-z]", "", str(v or "").lower().replace("ordertype", "").replace("positiontype", ""))
+    return s
 
-    # ----- state read from the synchronized terminal (no network) -----
-    def _state(self):
-        return self.conn.terminal_state
 
-    async def account_info(self) -> Dict[str, Any]:
-        info = None
+def _side(t: str) -> str:
+    return "buy" if t.startswith("buy") else "sell"
+
+
+def _pending(t: str) -> bool:
+    return "limit" in t or "stop" in t
+
+
+def _pretty_type(t: str) -> str:
+    kind = "stop_limit" if "stoplimit" in t else "limit" if "limit" in t else "stop" if "stop" in t else ""
+    return f"{_side(t)}_{kind}" if kind else _side(t)
+
+
+# ---------------------------------------------------------------- HTTP client
+class MrpcHttp:
+    def __init__(self, api_key: str, http: Optional[httpx.AsyncClient] = None):
+        self.api_key = api_key
+        self.http = http or httpx.AsyncClient(timeout=20)
+
+    async def call(self, platform: str, path: str, params: Optional[Dict[str, Any]] = None, sid: Optional[str] = None) -> Any:
+        headers = {"APIKey": self.api_key}
+        q = {k: v for k, v in (params or {}).items() if v is not None}
+        if sid:
+            headers["id"] = sid
+            q.setdefault("id", sid)        # some deployments read the id from the query instead of the header
         try:
-            info = self._state().account_information
-        except Exception:
-            info = None
-        if not info:
-            info = await self.conn.get_account_information()
-        margin = _num(info.get("margin"))
-        equity = _num(info.get("equity"))
+            r = await self.http.get(HOSTS[platform] + path, params=q, headers=headers)
+        except httpx.TimeoutException as e:
+            raise ApiError(504, "The broker gateway did not answer in time. Try again.", "timeout") from e
+        except httpx.HTTPError as e:
+            raise ApiError(502, "Could not reach the MetaRPC gateway.", "upstream_error") from e
+        text = r.text or ""
+        if r.status_code in (401, 403) and not BAD_LOGIN.search(text):
+            raise ApiError(502, "The MetaRPC API key was refused or lacks permission. The server operator needs to check MRPC_API_KEY and the MetaRPC plan.", "mrpc_auth")
+        if r.status_code == 429:
+            raise ApiError(429, "The broker gateway is rate limiting requests. Wait a moment.", "rate_limited")
+        if r.status_code >= 500:
+            raise ApiError(502, "The MetaRPC gateway had an error. Try again.", "upstream_error")
+        try:
+            body = r.json()
+        except ValueError:
+            body = text.strip().strip('"')
+        if r.status_code >= 400:
+            raise MrpcError(r.status_code, str(_g(body, "message", "error", "detail") or body)[:300])
+        if isinstance(body, dict):                      # some gateways answer 200 with an error object
+            err = _g(body, "error", "errorMessage")
+            if err and not _g(body, "result", "data", "id"):
+                raise MrpcError(400, str(err)[:300])
+        return body
+
+
+def _parse_sid(res: Any) -> str:
+    if isinstance(res, dict):
+        res = _g(_unwrap(res), "terminalInstanceGuid", "id", "guid", "token", "sessionId", default=_unwrap(res))
+    sid = str(res or "").strip().strip('"')
+    if not re.fullmatch(r"[0-9A-Za-z\-_]{8,64}", sid):
+        raise MrpcError(400, "The gateway did not return a terminal id.")
+    return sid
+
+
+# ---------------------------------------------------------------- session
+class MrpcSession(BrokerSession):
+    def __init__(self, key: str, mgr: "MrpcManager", sid: str, info: Dict[str, Any]):
+        super().__init__(key, None, None, info)
+        self.mgr = mgr
+        self.sid = sid
+        self.platform = info.get("platform", "mt5")
+        self._cache: Dict[str, Any] = {}
+
+    # --- transport with one transparent restart if the gateway lost the terminal
+    async def _call(self, name: str, **params) -> Any:
+        try:
+            res = await self.mgr.client.call(self.platform, EP[name], params, self.sid)
+            self.mgr._debug_seen(name, res)
+            return res
+        except MrpcError as e:
+            self.mgr._debug_seen(name, f"HTTP {e.status}: {e.message}", failed=True)
+            if SESSION_GONE.search(e.message):                 # only an explicit "terminal gone" message restarts it
+                await self.mgr._reconnect(self)
+                try:
+                    return await self.mgr.client.call(self.platform, EP[name], params, self.sid)
+                except MrpcError as e2:
+                    raise self.mgr._as_api_error(e2)
+            if e.status in (404, 405):                         # wrong path/verb: a code problem, not a lost terminal
+                raise ApiError(502, f"The MetaRPC gateway has no call {EP[name]}. The server operator must correct it in mrpc_manager.py (EP table).", "bad_endpoint")
+            raise self.mgr._as_api_error(e)
+
+    async def _cached(self, name: str, ttl: float, fn):
+        hit = self._cache.get(name)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+        val = await fn()
+        self._cache[name] = (time.time(), val)
+        return val
+
+    def _bust(self):
+        self._cache.pop("opened", None)
+        self._cache.pop("account", None)
+
+    # --- account
+    async def account_info(self) -> Dict[str, Any]:
+        self.last_used = time.time()
+        raw = _flat(await self._cached("account", 1.5, lambda: self._call("account")))
+        if not any(k in {x.lower() for x in raw} for k in ("balance", "equity", "accountbalance", "accountequity")):
+            self.mgr._warn_once("account-keys", "AccountSummary has no recognisable balance field; keys seen: %s" % sorted(raw)[:40])
+        margin = _num(_g(raw, "margin", "accountMargin", "usedMargin"))
+        equity = _num(_g(raw, "equity", "accountEquity"))
         return {
-            "login": str(info.get("login", self.info["login"])),
-            "name": info.get("name") or "",
-            "broker": info.get("broker") or self.info.get("broker_name") or "",
-            "server": info.get("server") or self.info["server"],
-            "platform": self.info["platform"],
-            "currency": info.get("currency") or "USD",
-            "leverage": info.get("leverage"),
-            "balance": _num(info.get("balance")),
+            "login": str(_g(raw, "login", "account", "accountNumber", default=self.info["login"])),
+            "name": _g(raw, "name", "userName", "accountName", default="") or "",
+            "broker": _g(raw, "company", "broker", "companyName", default="") or self.info.get("broker_name") or "",
+            "server": _g(raw, "server", "serverName", default=self.info["server"]),
+            "platform": self.platform,
+            "currency": _g(raw, "currency", "accountCurrency", "depositCurrency", default="USD") or "USD",
+            "leverage": _g(raw, "leverage", "accountLeverage"),
+            "balance": _num(_g(raw, "balance", "accountBalance")),
             "equity": equity,
             "margin": margin,
-            "freeMargin": _num(info.get("freeMargin")),
+            "freeMargin": _num(_g(raw, "freeMargin", "free_margin", "marginFree", "accountFreeMargin")),
             "marginLevel": (equity / margin * 100) if margin > 0 else None,
-            "credit": _num(info.get("credit")),
-            "tradeAllowed": info.get("tradeAllowed", True),
-            "type": info.get("type"),
+            "credit": _num(_g(raw, "credit", "accountCredit")),
+            "tradeAllowed": not bool(_g(raw, "isInvestor", "investor", default=False)),
+            "type": _g(raw, "accountType", "tradeMode"),
         }
 
-    @staticmethod
-    def _position(p: Dict[str, Any]) -> Dict[str, Any]:
-        t = str(p.get("type", ""))
-        return {
-            "id": str(p.get("id")),
-            "symbol": p.get("symbol"),
-            "side": "buy" if "BUY" in t else "sell",
-            "volume": _num(p.get("volume")),
-            "openPrice": _num(p.get("openPrice")),
-            "currentPrice": _num(p.get("currentPrice")),
-            "stopLoss": p.get("stopLoss"),
-            "takeProfit": p.get("takeProfit"),
-            "profit": _num(p.get("profit")),
-            "swap": _num(p.get("swap")),
-            "commission": _num(p.get("commission")),
-            "openTime": _epoch(p.get("time")),
-            "comment": p.get("comment") or "",
-        }
+    # --- positions and pending orders (both come from one OpenedOrders call)
+    async def _opened(self) -> List[Dict[str, Any]]:
+        return await self._cached("opened", 1.5, self._fetch_opened)
+
+    async def _fetch_opened(self):
+        return _rows(await self._call("opened"), "orders", "positions")
 
     @staticmethod
-    def _order(o: Dict[str, Any]) -> Dict[str, Any]:
-        t = str(o.get("type", "")).replace("ORDER_TYPE_", "")
-        return {
-            "id": str(o.get("id")),
-            "symbol": o.get("symbol"),
-            "type": t.lower(),              # buy_limit, sell_stop, ...
-            "side": "buy" if t.startswith("BUY") else "sell",
-            "volume": _num(o.get("currentVolume", o.get("volume"))),
-            "price": _num(o.get("openPrice")),
-            "stopLimitPrice": o.get("stopLimitPrice"),
-            "stopLoss": o.get("stopLoss"),
-            "takeProfit": o.get("takeProfit"),
-            "currentPrice": o.get("currentPrice"),
-            "time": _epoch(o.get("time")),
-            "expiration": _epoch(o.get("expirationTime")),
-            "comment": o.get("comment") or "",
-        }
+    def _ticket(r) -> str:
+        return str(_g(r, "ticket", "id", "order", "positionId", default=""))
 
     async def positions(self) -> List[Dict[str, Any]]:
-        raw = None
-        try:
-            raw = self._state().positions
-        except Exception:
-            raw = None
-        if raw is None:
-            raw = await self.conn.get_positions()
-        return [self._position(p) for p in raw]
+        self.last_used = time.time()
+        out = []
+        for r in await self._opened():
+            t = _optype(_g(r, "type", "orderType", "cmd", "operation"))
+            if not t or _pending(t):
+                continue
+            out.append({
+                "id": self._ticket(r), "symbol": _g(r, "symbol"), "side": _side(t),
+                "volume": _num(_g(r, "lots", "volume")), "openPrice": _num(_g(r, "openPrice", "priceOpen")),
+                "currentPrice": _num(_g(r, "closePrice", "currentPrice", "priceCurrent")),
+                "stopLoss": _g(r, "stopLoss", "sl") or None, "takeProfit": _g(r, "takeProfit", "tp") or None,
+                "profit": _num(_g(r, "profit")), "swap": _num(_g(r, "swap")),
+                "commission": _num(_g(r, "commission")),
+                "openTime": _epoch(_g(r, "openTime", "time")), "comment": _g(r, "comment", default="") or "",
+            })
+        return out
 
     async def orders(self) -> List[Dict[str, Any]]:
-        raw = None
-        try:
-            raw = self._state().orders
-        except Exception:
-            raw = None
-        if raw is None:
-            raw = await self.conn.get_orders()
-        return [self._order(o) for o in raw]
-
-    async def symbols(self) -> List[Dict[str, Any]]:
-        specs = []
-        try:
-            specs = list(self._state().specifications or [])
-        except Exception:
-            specs = []
-        if not specs:
-            names = await self.conn.get_symbols()
-            specs = [{"symbol": n} for n in names]
+        self.last_used = time.time()
         out = []
-        for s in specs:
-            path = (s.get("path") or "").replace("\\", "/")
+        for r in await self._opened():
+            t = _optype(_g(r, "type", "orderType", "cmd", "operation"))
+            if not t or not _pending(t):
+                continue
+            out.append({
+                "id": self._ticket(r), "symbol": _g(r, "symbol"), "type": _pretty_type(t), "side": _side(t),
+                "volume": _num(_g(r, "lots", "volume")), "price": _num(_g(r, "openPrice", "price")),
+                "stopLimitPrice": _g(r, "stopLimitPrice", "stopLimit"),
+                "stopLoss": _g(r, "stopLoss", "sl") or None, "takeProfit": _g(r, "takeProfit", "tp") or None,
+                "currentPrice": _g(r, "closePrice", "currentPrice"),
+                "time": _epoch(_g(r, "openTime", "time")), "expiration": _epoch(_g(r, "expiration", "expirationTime")),
+                "comment": _g(r, "comment", default="") or "",
+            })
+        return out
+
+    # --- symbols / specification / prices
+    async def symbols(self) -> List[Dict[str, Any]]:
+        raw = _unwrap(await self._cached("symbols", 600, lambda: self._call("symbols")))
+        out = []
+        for s in raw or []:
+            d = s if isinstance(s, dict) else {"symbol": s}
+            name = _g(d, "symbol", "name")
+            if not name:
+                continue
+            path = str(_g(d, "path", "group", default="") or "").replace("\\", "/")
             parts = [p for p in path.split("/") if p]
             out.append({
-                "symbol": s.get("symbol"),
-                "description": s.get("description") or "",
-                "path": path,
-                "category": parts[0] if len(parts) > 1 else "Other",
-                "digits": s.get("digits"),
-                "tickSize": s.get("tickSize"),
-                "contractSize": s.get("contractSize"),
-                "minVolume": s.get("minVolume"),
-                "maxVolume": s.get("maxVolume"),
-                "volumeStep": s.get("volumeStep"),
-                "baseCurrency": s.get("baseCurrency"),
-                "profitCurrency": s.get("profitCurrency"),
-                "tradeMode": s.get("tradeMode"),
+                "symbol": name, "description": _g(d, "description", default="") or "", "path": path,
+                "category": parts[0] if len(parts) > 1 else _guess_category(name),
+                "digits": _g(d, "digits"), "tickSize": _g(d, "tickSize", "point"),
+                "contractSize": _g(d, "contractSize"), "minVolume": _g(d, "minVolume", "lotsMin"),
+                "maxVolume": _g(d, "maxVolume", "lotsMax"), "volumeStep": _g(d, "volumeStep", "lotsStep"),
+                "baseCurrency": _g(d, "baseCurrency"), "profitCurrency": _g(d, "profitCurrency"),
+                "tradeMode": _g(d, "tradeMode"),
             })
-        return [s for s in out if s["symbol"]]
+        return out
 
     async def spec(self, symbol: str) -> Dict[str, Any]:
         if symbol not in self.spec_cache:
-            self.spec_cache[symbol] = await self.conn.get_symbol_specification(symbol)
+            raw = _unwrap(await self._call("symbol_params", symbol=symbol))
+            raw = raw[0] if isinstance(raw, list) and raw else raw
+            self.spec_cache[symbol] = {
+                "symbol": symbol, "digits": _g(raw, "digits"), "tickSize": _g(raw, "tickSize", "point"),
+                "contractSize": _g(raw, "contractSize"), "minVolume": _g(raw, "minVolume", "lotsMin", "volumeMin"),
+                "maxVolume": _g(raw, "maxVolume", "lotsMax", "volumeMax"),
+                "volumeStep": _g(raw, "volumeStep", "lotsStep"),
+            }
         return self.spec_cache[symbol]
-
-    async def _subscribe(self, symbol: str):
-        if symbol in self.subscribed:
-            return
-        await self.conn.subscribe_to_market_data(symbol, [{"type": "quotes", "intervalInMilliseconds": 1000}])
-        self.subscribed.add(symbol)
 
     async def quotes(self, symbols: List[str]) -> Dict[str, Any]:
         self.last_used = time.time()
-        out: Dict[str, Any] = {}
-        for sym in symbols[:60]:
-            price = None
+        sem = asyncio.Semaphore(8)
+
+        async def one(sym: str):
+            async def fetch():
+                async with sem:
+                    return _unwrap(await self._call("quote", symbol=sym))
             try:
-                await self._subscribe(sym)
-                price = self._state().price(sym)
-            except Exception:
-                price = None
-            if not price:
-                try:
-                    price = await self.conn.get_symbol_price(sym)
-                except Exception:
-                    price = None
-            if price:
-                out[sym] = {
-                    "bid": _num(price.get("bid")),
-                    "ask": _num(price.get("ask")),
-                    "time": _epoch(price.get("time")) or int(time.time()),
-                }
-        return out
+                q = await self._cached("q:" + sym, 1.0, fetch)
+            except (ApiError, MrpcError):
+                return sym, None
+            bid, ask = _num(_g(q, "bid")), _num(_g(q, "ask"))
+            if not bid and not ask:
+                return sym, None
+            return sym, {"bid": bid, "ask": ask, "time": _epoch(_g(q, "time", "timestamp")) or int(time.time())}
+
+        pairs = await asyncio.gather(*(one(s) for s in symbols[:60]))
+        return {s: q for s, q in pairs if q}
 
     async def candles(self, symbol: str, timeframe: str, limit: int, before: Optional[int]) -> List[Dict[str, Any]]:
-        tf = TIMEFRAMES.get(timeframe)
-        if not tf:
+        if timeframe not in TF_MINUTES:
             raise ApiError(400, f"Unsupported timeframe {timeframe}")
         limit = max(1, min(limit, 1000))
-        if before:
-            start = datetime.fromtimestamp(before, tz=timezone.utc)
-        else:
-            start = datetime.now(timezone.utc) + timedelta(seconds=TF_SECONDS[timeframe])
-        raw = await self.account.get_historical_candles(symbol, tf, start, limit)
-        rows = []
-        for c in raw or []:
-            t = _epoch(c.get("time"))
-            if t is None:
+        end = datetime.fromtimestamp(before, tz=timezone.utc) if before else datetime.now(timezone.utc) + timedelta(seconds=TF_SECONDS[timeframe])
+        start = end - timedelta(seconds=TF_SECONDS[timeframe] * (limit + 5))
+        raw = _rows(await self._call("candles", symbol=symbol, timeframe=TF_MINUTES[timeframe],
+                                     **{"from": start.strftime("%Y-%m-%dT%H:%M:%S"), "to": end.strftime("%Y-%m-%dT%H:%M:%S")}),
+                    "candles", "bars")
+        rows, seen = [], set()
+        for c in raw:
+            t = _epoch(_g(c, "time", "timestamp", "openTime", "t"))
+            if t is None or t in seen or (before and t >= before):
                 continue
-            rows.append({
-                "t": t, "o": _num(c.get("open")), "h": _num(c.get("high")),
-                "l": _num(c.get("low")), "c": _num(c.get("close")),
-                "v": _num(c.get("tickVolume", c.get("volume"))),
-            })
+            seen.add(t)
+            rows.append({"t": t, "o": _num(_g(c, "open", "o")), "h": _num(_g(c, "high", "h")),
+                         "l": _num(_g(c, "low", "l")), "c": _num(_g(c, "close", "c")),
+                         "v": _num(_g(c, "tickVolume", "volume", "v"))})
         rows.sort(key=lambda r: r["t"])
-        if before:
-            rows = [r for r in rows if r["t"] < before]
-        # de-duplicate by time
-        seen, uniq = set(), []
-        for r in rows:
-            if r["t"] in seen:
-                continue
-            seen.add(r["t"])
-            uniq.append(r)
-        return uniq
+        return rows[-limit:]
 
     async def history(self, days: int) -> List[Dict[str, Any]]:
         days = max(1, min(days, 365))
         end = datetime.now(timezone.utc) + timedelta(minutes=5)
         start = end - timedelta(days=days)
-        res = await self.conn.get_deals_by_time_range(start, end)
-        deals = res.get("deals", res) if isinstance(res, dict) else res
+        raw = _rows(await self._call("history", **{"from": start.strftime("%Y-%m-%dT%H:%M:%S"), "to": end.strftime("%Y-%m-%dT%H:%M:%S")}),
+                    "orders", "history", "deals")
         out = []
-        for d in deals or []:
-            dtype = str(d.get("type", ""))
-            if dtype in ("DEAL_TYPE_BALANCE", "DEAL_TYPE_CREDIT", "DEAL_TYPE_CHARGE", "DEAL_TYPE_CORRECTION", "DEAL_TYPE_BONUS"):
-                out.append({
-                    "id": str(d.get("id")), "kind": "balance", "symbol": "",
-                    "time": _epoch(d.get("time")), "profit": _num(d.get("profit")),
-                    "comment": d.get("comment") or dtype.replace("DEAL_TYPE_", "").title(),
-                })
+        for d in raw:
+            t = _optype(_g(d, "type", "orderType", "cmd", "operation"))
+            when = _epoch(_g(d, "closeTime", "time", "openTime"))
+            if t in BALANCE_TYPES or (not t.startswith(("buy", "sell"))):
+                out.append({"id": self._ticket(d), "kind": "balance", "symbol": "", "time": when,
+                            "profit": _num(_g(d, "profit")), "comment": _g(d, "comment", default="") or (t or "balance").title()})
                 continue
-            if "BUY" not in dtype and "SELL" not in dtype:
+            if _pending(t):
                 continue
-            out.append({
-                "id": str(d.get("id")), "kind": "deal", "symbol": d.get("symbol"),
-                "side": "buy" if "BUY" in dtype else "sell",
-                "entry": str(d.get("entryType", "")).replace("DEAL_ENTRY_", "").lower(),
-                "volume": _num(d.get("volume")), "price": _num(d.get("price")),
-                "profit": _num(d.get("profit")), "swap": _num(d.get("swap")),
-                "commission": _num(d.get("commission")),
-                "positionId": str(d.get("positionId") or ""),
-                "time": _epoch(d.get("time")), "comment": d.get("comment") or "",
-            })
+            out.append({"id": self._ticket(d), "kind": "deal", "symbol": _g(d, "symbol"), "side": _side(t), "entry": "out",
+                        "volume": _num(_g(d, "lots", "volume")), "price": _num(_g(d, "closePrice", "price")),
+                        "profit": _num(_g(d, "profit")), "swap": _num(_g(d, "swap")),
+                        "commission": _num(_g(d, "commission")), "positionId": self._ticket(d),
+                        "time": when, "comment": _g(d, "comment", default="") or ""})
         out.sort(key=lambda r: r["time"] or 0, reverse=True)
         return out
 
-    # ----- trading -----
-    # ----- idempotent order submission -----
-    # A timeout does not mean the order failed. Every order carries a client-generated id that is also sent to the
-    # broker gateway as the order's clientId, so a repeat of the same request is answered from the first result,
-    # and an unclear outcome is settled by looking the order up instead of guessing.
-    def _prune_idem(self):
-        cutoff = time.time() - 6 * 3600
-        for k in [k for k, v in self.idem.items() if v["ts"] < cutoff and v["task"].done()]:
-            self.idem.pop(k, None)
-
-    async def _raw_lists(self):
-        pos = ords = None
-        try:
-            pos, ords = self._state().positions, self._state().orders
-        except Exception:
-            pos = ords = None
-        if pos is None:
-            pos = await self.conn.get_positions()
-        if ords is None:
-            ords = await self.conn.get_orders()
-        return list(pos or []), list(ords or [])
-
+    # --- idempotency: the client order id rides in the order comment ("kr:<id>") and is searched for on a timeout
     async def find_by_client_id(self, cid: str) -> Optional[Dict[str, Any]]:
-        """Look for an order we sent: open positions, working orders, then recent history."""
-        pos, ords = await self._raw_lists()
-        for p in pos:
-            if p.get("clientId") == cid:
-                return {"status": "executed", "positionId": str(p.get("id", "")), "orderId": str(p.get("id", ""))}
-        for o in ords:
-            if o.get("clientId") == cid:
-                return {"status": "working", "orderId": str(o.get("id", "")), "positionId": ""}
+        tag = CID_TAG + cid
+        self._cache.pop("opened", None)
+        for r in await self._fetch_opened():
+            if tag in str(_g(r, "comment", default="")):
+                t = _optype(_g(r, "type", "orderType", "cmd", "operation"))
+                tk = self._ticket(r)
+                if _pending(t):
+                    return {"status": "working", "orderId": tk, "positionId": ""}
+                return {"status": "executed", "positionId": tk, "orderId": tk}
         try:
             end = datetime.now(timezone.utc) + timedelta(minutes=5)
-            res = await self.conn.get_history_orders_by_time_range(end - timedelta(hours=6), end)
-            for o in (res or {}).get("historyOrders", []) or []:
-                if o.get("clientId") == cid:
-                    filled = str(o.get("state", "")).endswith(("FILLED", "PARTIALLY_FILLED"))
-                    return {"status": "executed" if filled else "not_executed", "orderId": str(o.get("id", "")),
-                            "positionId": str(o.get("positionId", ""))}
+            raw = _rows(await self._call("history", **{"from": (end - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S"),
+                                                       "to": end.strftime("%Y-%m-%dT%H:%M:%S")}), "orders", "history", "deals")
+            for r in raw:
+                if tag in str(_g(r, "comment", default="")):
+                    return {"status": "executed", "orderId": self._ticket(r), "positionId": self._ticket(r)}
         except Exception:  # noqa: BLE001 - history is a best-effort second look
             pass
         return None
 
-    async def order_status(self, cid: str) -> Dict[str, Any]:
-        entry = self.idem.get(cid)
-        if entry and not entry["task"].done():
-            return {"status": "submitting"}
-        found = await self.find_by_client_id(cid)
-        if found:
-            return found
-        if entry and entry["state"] == "rejected":
-            return {"status": "not_executed", "message": entry.get("message", "")}
-        return {"status": "not_found" if entry is None else "unknown"}
-
-    async def place_order(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        cid = req.get("clientOrderId")
-        if not cid:
-            return await self._place_order_raw(req, None)
-        self._prune_idem()
-        entry = self.idem.get(cid)
-        if entry is not None:
-            if not entry["task"].done():                       # same request still running: share its outcome
-                return await asyncio.shield(entry["task"])
-            if entry["state"] == "ok":                         # already done: return the first result
-                return {**entry["result"], "duplicate": True}
-            found = await self.find_by_client_id(cid)          # earlier attempt was unclear: settle it first
-            if found and found["status"] in ("executed", "working"):
-                res = {"ok": True, "orderId": found.get("orderId", ""), "positionId": found.get("positionId", ""),
-                       "message": "Order was already placed", "duplicate": True}
-                entry.update(state="ok", result=res)
-                return res
-            if entry["state"] == "unknown":
-                raise ApiError(409, "The earlier attempt of this order could not be confirmed. Check Positions and Orders before sending it again.", "order_unknown")
-        task = asyncio.ensure_future(self._place_order_raw(req, cid))
-        entry = {"task": task, "state": "pending", "result": None, "ts": time.time()}
-        self.idem[cid] = entry
-        try:
-            res = await asyncio.shield(task)
-        except asyncio.CancelledError:                         # the client went away: let the order finish, keep the record
-            raise
-        except Exception as e:  # noqa: BLE001
-            err = explain_error(e)
-            unclear = err.status in (502, 503, 504) or err.code in ("timeout", "upstream_error")
-            if not unclear:                                    # a definite refusal: nothing was placed
-                entry.update(state="rejected", message=err.message)
-                raise err
-            entry["state"] = "unknown"
-            found = None
-            try:
-                found = await self.find_by_client_id(cid)
-            except Exception:  # noqa: BLE001
-                pass
-            if found and found["status"] in ("executed", "working"):
-                res = {"ok": True, "orderId": found.get("orderId", ""), "positionId": found.get("positionId", ""),
-                       "message": "Order placed (confirmed after a slow reply)", "reconciled": True}
-                entry.update(state="ok", result=res)
-                return res
-            raise ApiError(504, "We could not confirm whether this order reached your broker. Check Positions and Orders before trying again.", "order_unknown")
-        entry.update(state="ok", result=res)
-        return res
-
     async def _place_order_raw(self, req: Dict[str, Any], cid: Optional[str]) -> Dict[str, Any]:
-        symbol = req["symbol"]
-        side = req["side"]
-        otype = req["type"]
+        symbol, side, otype = req["symbol"], req["side"], req["type"]
         volume = float(req["volume"])
         sl, tp = req.get("stopLoss"), req.get("takeProfit")
         price, limit_price = req.get("price"), req.get("stopLimitPrice")
@@ -477,64 +434,51 @@ class BrokerSession:
             raise ApiError(400, "Unsupported order type")
         if volume <= 0:
             raise ApiError(400, "Volume must be greater than zero")
-        spec = None
         try:
             spec = await self.spec(symbol)
-        except Exception:
-            pass
-        if not spec:
+        except (ApiError, MrpcError):
+            spec = None
+        if not spec or not (_num(spec.get("minVolume")) or _num(spec.get("volumeStep"))):
             raise ApiError(400, f"Could not read the contract specification for {symbol}. Try again in a moment.", "validation")
-        if spec:
-            vmin, vmax = _num(spec.get("minVolume")), _num(spec.get("maxVolume"))
-            vstep = _num(spec.get("volumeStep"))
-            if vstep and abs(round(volume / vstep) * vstep - volume) > 1e-9 * max(1, volume / vstep):
-                raise ApiError(400, f"Volume for {symbol} must be a multiple of {vstep} lots")
-            if vmin and volume < vmin - 1e-12:
-                raise ApiError(400, f"Minimum volume for {symbol} is {vmin} lots")
-            if vmax and volume > vmax + 1e-12:
-                raise ApiError(400, f"Maximum volume for {symbol} is {vmax} lots")
+        vmin, vmax, vstep = _num(spec.get("minVolume")), _num(spec.get("maxVolume")), _num(spec.get("volumeStep"))
+        if vstep and abs(round(volume / vstep) * vstep - volume) > 1e-9 * max(1, volume / vstep):
+            raise ApiError(400, f"Volume for {symbol} must be a multiple of {vstep} lots")
+        if vmin and volume < vmin - 1e-12:
+            raise ApiError(400, f"Minimum volume for {symbol} is {vmin} lots")
+        if vmax and volume > vmax + 1e-12:
+            raise ApiError(400, f"Maximum volume for {symbol} is {vmax} lots")
         if otype != "market" and not price:
             raise ApiError(400, "A price is required for pending orders")
         if otype == "stop_limit" and not limit_price:
             raise ApiError(400, "A stop-limit price is required for stop-limit orders")
-        if otype != "market":  # entry price is known, so the stop direction can be checked before the broker sees it
+        if otype != "market":
             if sl and (sl >= price if side == "buy" else sl <= price):
                 raise ApiError(400, "For a buy the stop loss must be below the entry price." if side == "buy" else "For a sell the stop loss must be above the entry price.", "validation")
             if tp and (tp <= price if side == "buy" else tp >= price):
                 raise ApiError(400, "For a buy the take profit must be above the entry price." if side == "buy" else "For a sell the take profit must be below the entry price.", "validation")
-        opts = {"comment": (req.get("comment") or "KanAIRY")[:26]}
-        if cid:
-            opts["clientId"] = cid
-        c = self.conn
-        if otype == "market":
-            fn = c.create_market_buy_order if side == "buy" else c.create_market_sell_order
-            res = await fn(symbol, volume, sl, tp, opts)
-        elif otype == "limit":
-            fn = c.create_limit_buy_order if side == "buy" else c.create_limit_sell_order
-            res = await fn(symbol, volume, price, sl, tp, opts)
-        elif otype == "stop":
-            fn = c.create_stop_buy_order if side == "buy" else c.create_stop_sell_order
-            res = await fn(symbol, volume, price, sl, tp, opts)
-        else:
-            fn = c.create_stop_limit_buy_order if side == "buy" else c.create_stop_limit_sell_order
-            res = await fn(symbol, volume, price, limit_price, sl, tp, opts)
-        return {
-            "ok": True,
-            "orderId": str(res.get("orderId", "")),
-            "positionId": str(res.get("positionId", "")),
-            "code": res.get("stringCode"),
-            "message": res.get("message") or "Order accepted",
-        }
+        params = self._send_params(symbol, OPERATION[(side, otype)], volume, price, limit_price, sl, tp,
+                                   (CID_TAG + cid) if cid else (req.get("comment") or "KanAIRY")[:26])
+        res = _unwrap(await self._call("send", **params))
+        self._bust()
+        ticket = str(_g(res, "ticket", "order", "orderId", "id", default=res if isinstance(res, (int, str)) else "") or "")
+        return {"ok": True, "orderId": ticket, "positionId": ticket if otype == "market" else "",
+                "code": _g(res, "code", "retcode"), "message": _g(res, "message", default="Order accepted") or "Order accepted"}
+
+    @staticmethod
+    def _send_params(symbol, operation, volume, price, limit_price, sl, tp, comment) -> Dict[str, Any]:
+        """OrderSend parameter names (unverified: adjust here if the probe shows different ones)."""
+        return {"symbol": symbol, "operation": operation, "volume": volume, "price": price,
+                "stoploss": sl, "takeprofit": tp, "stopLimitPrice": limit_price, "comment": comment}
 
     async def modify_position(self, position_id: str, sl, tp) -> Dict[str, Any]:
-        # None means "leave unchanged": fill it from live state so the broker never reads a missing value as "remove".
         cur = next((p for p in await self.positions() if p["id"] == str(position_id)), None)
         if cur is None:
             raise ApiError(404, "That position is no longer open.", "not_found")
         sl = cur["stopLoss"] if sl is None else sl
         tp = cur["takeProfit"] if tp is None else tp
-        res = await self.conn.modify_position(position_id, sl or 0, tp or 0)
-        return {"ok": True, "message": res.get("message") or "Position updated"}
+        res = _unwrap(await self._call("modify", ticket=position_id, price=cur["openPrice"], stoploss=sl or 0, takeprofit=tp or 0))
+        self._bust()
+        return {"ok": True, "message": _g(res, "message", default="Position updated") or "Position updated"}
 
     async def close_position(self, position_id: str, volume: Optional[float]) -> Dict[str, Any]:
         if volume:
@@ -543,15 +487,14 @@ class BrokerSession:
                 raise ApiError(404, "That position is no longer open.", "not_found")
             if volume >= cur["volume"] - 1e-12:
                 volume = None
-        if volume:
-            res = await self.conn.close_position_partially(position_id, volume)
-        else:
-            res = await self.conn.close_position(position_id)
-        return {"ok": True, "message": res.get("message") or "Position closed"}
+        res = _unwrap(await self._call("close", ticket=position_id, lots=volume or None))
+        self._bust()
+        return {"ok": True, "message": _g(res, "message", default="Position closed") or "Position closed"}
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        res = await self.conn.cancel_order(order_id)
-        return {"ok": True, "message": res.get("message") or "Order cancelled"}
+        res = _unwrap(await self._call("close", ticket=order_id))
+        self._bust()
+        return {"ok": True, "message": _g(res, "message", default="Order cancelled") or "Order cancelled"}
 
     async def modify_order(self, order_id: str, price, sl, tp) -> Dict[str, Any]:
         cur = next((o for o in await self.orders() if o["id"] == str(order_id)), None)
@@ -560,278 +503,188 @@ class BrokerSession:
         price = cur["price"] if price is None else price
         sl = cur["stopLoss"] if sl is None else sl
         tp = cur["takeProfit"] if tp is None else tp
-        res = await self.conn.modify_order(order_id, price, sl or 0, tp or 0)
-        return {"ok": True, "message": res.get("message") or "Order updated"}
+        res = _unwrap(await self._call("modify", ticket=order_id, price=price, stoploss=sl or 0, takeprofit=tp or 0))
+        self._bust()
+        return {"ok": True, "message": _g(res, "message", default="Order updated") or "Order updated"}
 
 
-class BrokerManager:
-    def __init__(self, token: str, api: Any = None, http: Optional[httpx.AsyncClient] = None):
-        self.token = token
-        if api is None:
-            from metaapi_cloud_sdk import MetaApi  # imported lazily so the app boots without it
-            api = MetaApi(token)
-        self.api = api
-        self.http = http or httpx.AsyncClient(timeout=20)
-        self.sessions: Dict[str, BrokerSession] = {}
+def _guess_category(name: str) -> str:
+    n = name.upper()
+    if re.fullmatch(r"[A-Z]{6}[A-Z._0-9]{0,4}", n) and n[:3] in {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "ZAR"}:
+        return "Forex"
+    if n.startswith(("XAU", "XAG", "XPT", "XPD")):
+        return "Metals"
+    if n.startswith(("BTC", "ETH", "LTC", "XRP")):
+        return "Crypto"
+    if any(k in n for k in ("OIL", "BRENT", "WTI", "NGAS")):
+        return "Energies"
+    return "Other"
+
+
+# ---------------------------------------------------------------- manager
+class MrpcManager(BrokerManager):
+    """Same public surface as BrokerManager, backed by MetaRPC."""
+
+    def __init__(self, api_key: str, http: Optional[httpx.AsyncClient] = None, idle_seconds: int = 600, cred_ttl: int = 12 * 3600):
+        self.token = api_key
+        self.client = MrpcHttp(api_key, http)
+        self.http = self.client.http
+        self.idle_seconds = idle_seconds
+        self.cred_ttl = cred_ttl
+        self.sessions: Dict[str, MrpcSession] = {}
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self._attach_locks: Dict[str, asyncio.Lock] = {}
         self._broker_cache: Dict[str, Any] = {}
+        self._creds: Dict[str, Dict[str, Any]] = {}      # in memory only, see module docstring
+        self.debug = os.getenv("MRPC_DEBUG", "").strip() not in ("", "0", "false")
+        self._seen: set = set()
 
-    @staticmethod
-    def key(login: str, server: str) -> str:
-        return f"{str(login).strip()}|{server.strip().lower()}"
-
-    # ----- broker directory (every server MetaApi knows for MT4/MT5) -----
-    async def search_brokers(self, query: str, version: int = 5) -> Dict[str, List[str]]:
-        query = (query or "").strip()
-        if len(query) < 2:
-            return {}
-        ck = f"{version}:{query.lower()}"
-        hit = self._broker_cache.get(ck)
-        if hit and time.time() - hit[0] < 6 * 3600:
-            return hit[1]
+    def _debug_seen(self, name: str, res: Any, failed: bool = False):
+        """MRPC_DEBUG=1: log each call's first real response (never ConnectEx, so no password) to learn the true shapes."""
+        k = (name, failed)
+        if not self.debug or k in self._seen:
+            return
+        self._seen.add(k)
         try:
-            r = await self.http.get(
-                f"{PROVISIONING_HOST}/known-mt-servers/{int(version)}/search",
-                params={"query": query}, headers={"auth-token": self.token},
-            )
-        except httpx.HTTPError as e:
-            raise ApiError(502, "Could not reach the MetaApi broker directory.", "upstream_error") from e
-        if r.status_code in (401, 403):
-            raise ApiError(502, "The MetaApi token was refused. The server operator needs to check METAAPI_TOKEN.", "metaapi_auth")
-        if r.status_code >= 400:
-            raise ApiError(502, f"Broker directory error ({r.status_code}).", "upstream_error")
-        data = r.json()
-        if not isinstance(data, dict):
-            data = {}
-        data = {str(k): [str(s) for s in v] for k, v in data.items() if isinstance(v, list)}
-        self._broker_cache[ck] = (time.time(), data)
-        return data
+            body = res if isinstance(res, str) else json.dumps(res, default=str)
+        except Exception:  # noqa: BLE001
+            body = str(res)
+        log.info("MRPC_DEBUG %s%s %s -> %s", "FAILED " if failed else "", name, EP.get(name, ""), body[:700])
+
+    def _warn_once(self, key: str, msg: str):
+        if key not in self._seen:
+            self._seen.add(key)
+            log.warning(msg)
+
+    # MetaRPC has no server directory; the connect screen's manual "server name" field is the way in.
+    async def search_brokers(self, query: str, version: int = 5) -> Dict[str, List[str]]:
+        return {}
 
     async def popular_brokers(self, version: int = 5) -> Dict[str, List[str]]:
-        ck = f"popular:{version}"
-        hit = self._broker_cache.get(ck)
-        if hit and time.time() - hit[0] < 6 * 3600:
-            return hit[1]
-        results = await asyncio.gather(*[self.search_brokers(q, version) for q in POPULAR_BROKERS], return_exceptions=True)
-        merged: Dict[str, List[str]] = {}
-        failures = 0
-        for res in results:
-            if isinstance(res, Exception):
-                failures += 1
-                continue
-            for broker, servers in res.items():
-                merged.setdefault(broker, [])
-                for s in servers:
-                    if s not in merged[broker]:
-                        merged[broker].append(s)
-        if failures == len(results):
-            raise ApiError(502, "Could not load the broker directory right now.", "upstream_error")
-        self._broker_cache[ck] = (time.time(), merged)
-        return merged
+        return {}
 
-    # ----- connecting -----
-    async def _find_account(self, login: str, server: str):
-        mt = self.api.metatrader_account_api
-        accounts: List[Any] = []
-        flt = {"query": str(login), "limit": 100}
-        fn = getattr(mt, "get_accounts_with_infinite_scroll_pagination", None)
-        if fn:
-            accounts = await fn(flt)
-        else:
-            accounts = await mt.get_accounts(flt)
-        want = server.strip().lower()
-        for a in accounts:
-            if str(a.login) == str(login) and str(a.server).strip().lower() == want:
-                return a
-        return None
+    @staticmethod
+    def _as_api_error(e: MrpcError) -> ApiError:
+        if BAD_LOGIN.search(e.message):
+            return ApiError(401, "The broker did not accept this login. Check the account number, the trading password (not the investor password) and that the server name matches your MetaTrader terminal exactly.", "bad_credentials")
+        return ApiError(e.status if 400 <= e.status < 600 else 502, e.message or "The broker gateway refused the request.", "upstream_error")
 
-    async def _wait_broker(self, job_id: str, account: Any, limit: int = 150):
-        """Wait for the terminal to sign in to the broker, reporting progress and failing early with a clear reason.
+    async def _start_terminal(self, platform: str, login: str, password: str, server: str) -> str:
+        try:
+            res = await self.client.call(platform, EP["connect"], {"user": login, "password": password, "mtClusterName": server})
+            return _parse_sid(res)
+        except MrpcError as e:
+            raise self._as_api_error(e)
 
-        MetaApi reports DISCONNECTED while the terminal starts and DISCONNECTED_FROM_BROKER once the terminal is up
-        but the broker is not accepting the login. A terminal that stays disconnected from the broker is almost
-        always a wrong password, wrong server name or a broker that blocks the gateway.
-        """
-        start = time.time()
-        stuck_since = None
-        while True:
-            await account.reload()
-            status = str(getattr(account, "connection_status", "") or "")
-            replicas = [str(getattr(r, "connection_status", "") or "") for r in getattr(account, "replicas", []) or []]
-            if "CONNECTED" in [status] + replicas:
+    async def _wait_ready(self, platform: str, sid: str, job_id: Optional[str] = None, limit: int = 90):
+        deadline = time.time() + limit
+        last: Optional[MrpcError] = None
+        while time.time() < deadline:
+            try:
+                await self.client.call(platform, EP["account"], None, sid)
                 return
-            waited = int(time.time() - start)
-            if status == "DISCONNECTED_FROM_BROKER":
-                stuck_since = stuck_since or time.time()
-                self._set(job_id, "connecting", f"Your terminal is running but the broker has not accepted the login yet ({waited}s)")
-                if time.time() - stuck_since > 75:
-                    raise ApiError(401, "The broker did not accept this login. Check the account number, the trading password (not the investor password) and that the server name matches your MetaTrader terminal exactly.", "bad_credentials")
-            else:
-                stuck_since = None
-                self._set(job_id, "connecting", f"Starting your terminal ({waited}s)")
-            if waited > limit:
-                raise ApiError(504, "The broker did not answer in time. Check the server name and password, then try again.", "timeout")
+            except MrpcError as e:
+                last = e
+                if BAD_LOGIN.search(e.message) and not SESSION_GONE.search(e.message):
+                    raise self._as_api_error(e)
             await asyncio.sleep(2)
-
-    async def _open(self, account: Any, wait_seconds: int = 240):
-        if getattr(account, "state", None) not in ("DEPLOYED", "DEPLOYING"):
-            await account.deploy()
-        await account.wait_connected(wait_seconds)
-        conn = account.get_streaming_connection()
-        await conn.connect()
-        await conn.wait_synchronized({"timeoutInSeconds": wait_seconds})
-        return conn
-
-    def _set(self, job_id: str, state: str, message: str, **extra):
-        job = self.jobs.setdefault(job_id, {})
-        job.update({"state": state, "message": message, "updated": time.time(), **extra})
-
-    async def start_connect(self, login: str, password: str, server: str, platform: str,
-                            broker_name: str, on_ready) -> str:
-        if not re.fullmatch(r"\d{3,12}", str(login).strip()):
-            raise ApiError(400, "Account number must be digits only.", "validation")
-        if platform not in ("mt4", "mt5"):
-            raise ApiError(400, "Platform must be mt4 or mt5.", "validation")
-        if not password or not server.strip():
-            raise ApiError(400, "Password and server are required.", "validation")
-        # keep job table small
-        for jid in [j for j, v in self.jobs.items() if time.time() - v.get("updated", 0) > 1800]:
-            self.jobs.pop(jid, None)
-        job_id = uuid.uuid4().hex
-        # The job id appears in URLs and server logs, so it must not be enough to collect the session token.
-        # The caller also gets a secret poll key (never logged: it travels in a header); only its hash is kept.
-        poll_key = secrets.token_urlsafe(24)
-        self._set(job_id, "queued", "Starting", poll_hash=hashlib.sha256(poll_key.encode()).hexdigest())
-        asyncio.create_task(self._connect_job(job_id, str(login).strip(), password, server.strip(), platform, broker_name, on_ready))
-        return job_id, poll_key
+        raise ApiError(504, "The broker did not answer in time. Check the server name and password, then try again.", "timeout") from last
 
     async def _connect_job(self, job_id, login, password, server, platform, broker_name, on_ready):
         try:
             key = self.key(login, server)
-            self._set(job_id, "provisioning", "Looking up your account")
-            account = await self._find_account(login, server)
-            if account is not None:
-                # An account already exists on the gateway. Never hand out a session just because it exists:
-                # the caller must prove they know the password it was linked with.
-                meta = getattr(account, "metadata", None)
-                proof = meta.get("kanairy") if isinstance(meta, dict) else None
-                if not check_proof(password, proof):
-                    # A live, signed-in account belongs to whoever linked it: refuse. But an account that is NOT
-                    # connected to the broker never worked (typically the first attempt had a mistyped password
-                    # and that wrong password got stored as the proof). Locking the user out of it forever is the
-                    # bug; re-link it with the new password, and the broker check below proves it is correct.
-                    if str(getattr(account, "connection_status", "") or "") == "CONNECTED":
-                        raise ApiError(401, "That password does not match the one this account was linked with here, or the account was linked elsewhere. Nothing was changed.", "bad_credentials")
-                    self._set(job_id, "provisioning", "Updating your saved login")
-                    await account.update({
-                        "name": f"KanAIRY {login}",
-                        "password": password,
-                        "server": server,
-                        "magic": 0,
-                        "metadata": {"kanairy": make_proof(password)},
-                    })
-                    await account.redeploy()
-            if account is None:
-                self._set(job_id, "provisioning", "Registering your account with the broker gateway")
-                account = await self.api.metatrader_account_api.create_account({
-                    "name": f"KanAIRY {login}",
-                    "type": "cloud-g2",
-                    "login": login,
-                    "password": password,
-                    "server": server,
-                    "platform": platform,
-                    "application": "MetaApi",
-                    "magic": 0,
-                    "metadata": {"kanairy": make_proof(password)},
-                })
             self._set(job_id, "deploying", "Starting your trading terminal")
-            if getattr(account, "state", None) not in ("DEPLOYED", "DEPLOYING"):
-                await account.deploy()
+            sid = await self._start_terminal(platform, login, password, server)
             self._set(job_id, "connecting", "Signing in to the broker")
-            await self._wait_broker(job_id, account)
-            self._set(job_id, "syncing", "Synchronising positions and prices")
-            conn = account.get_streaming_connection()
-            await conn.connect()
-            await conn.wait_synchronized({"timeoutInSeconds": 120})
-            session = BrokerSession(key, account, conn, {
-                "login": login, "server": server, "platform": platform, "broker_name": broker_name,
-            })
+            await self._wait_ready(platform, sid, job_id)
+            self._set(job_id, "syncing", "Loading positions and prices")
+            old = self.sessions.pop(key, None)
+            session = MrpcSession(key, self, sid, {"login": login, "server": server, "platform": platform, "broker_name": broker_name})
             self.sessions[key] = session
+            self._creds[key] = {"password": password, "ts": time.time()}
+            if old and old.sid != sid:
+                asyncio.create_task(self._stop(old))
             info = await session.account_info()
             token = await on_ready(session, info)
             self._set(job_id, "ready", "Connected", token=token, account=info)
         except Exception as e:  # noqa: BLE001
-            err = explain_error(e)
-            detail = str(e).replace(password, "***") if password else str(e)
-            logging.getLogger("kanairy").warning("connect failed: login=%s server=%s platform=%s -> %s (%s) | %s: %s",
-                                                 login, server, platform, err.code, err.status, type(e).__name__, detail[:300])
+            err = e if isinstance(e, ApiError) else explain_error(e)
+            detail = str(e)
+            for secret in (password, quote(password, safe="")):
+                if secret:
+                    detail = detail.replace(secret, "***")
+            log.warning("connect failed: login=%s server=%s platform=%s -> %s (%s) | %s: %s",
+                        login, server, platform, err.code, err.status, type(e).__name__, detail[:300])
             self._set(job_id, "failed", err.message, code=err.code)
 
-    def job(self, job_id: str, poll_key: str = "") -> Dict[str, Any]:
-        job = self.jobs.get(job_id)
-        good = bool(job) and bool(poll_key) and hmac.compare_digest(
-            hashlib.sha256(str(poll_key).encode()).hexdigest(), str(job.get("poll_hash", "")))
-        if not good:  # same answer for "no such job" and "wrong key", so ids cannot be probed
-            raise ApiError(404, "Unknown connection attempt.", "not_found")
-        out = {k: v for k, v in job.items() if k not in ("updated", "poll_hash", "delivered")}
-        if job.get("state") == "ready":
-            if job.get("delivered"):
-                out.pop("token", None)
-                out["message"] = "Already collected"
-            else:  # the session token is handed over exactly once
-                job["delivered"] = True
-                job.pop("token", None)
-        return out
+    async def _stop(self, sess: MrpcSession, delete: bool = False):
+        try:
+            await self.client.call(sess.platform, EP["disconnect"], {"delete": "true"} if delete else None, sess.sid)
+        except Exception as e:  # noqa: BLE001 - nothing useful to do if the stop call fails
+            log.info("disconnect failed for %s: %s", sess.key, type(e).__name__)
 
-    async def session_for(self, claims: Dict[str, Any]) -> BrokerSession:
+    async def _reconnect(self, sess: MrpcSession):
+        """Start the terminal again from the in-memory credentials (after the gateway lost it)."""
+        cred = self._creds.get(sess.key)
+        if not cred:
+            self.sessions.pop(sess.key, None)
+            raise ApiError(401, "This session was paused. Connect your account again.", "relink")
+        if time.time() - getattr(sess, "last_restart", 0) < 60:       # never restart in a loop
+            raise ApiError(502, "The broker terminal keeps dropping. Wait a minute and try again.", "upstream_error")
+        sess.last_restart = time.time()
+        lock = self._attach_locks.setdefault(sess.key, asyncio.Lock())
+        async with lock:
+            try:
+                sid = await self._start_terminal(sess.platform, sess.info["login"], cred["password"], sess.info["server"])
+                await self._wait_ready(sess.platform, sid, limit=60)
+            except MrpcError as e:
+                raise self._as_api_error(e)
+            sess.sid = sid
+            sess._cache.clear()
+
+    async def session_for(self, claims: Dict[str, Any]) -> MrpcSession:
         key = self.key(claims["login"], claims["server"])
         sess = self.sessions.get(key)
         if sess:
             sess.last_used = time.time()
+            self._creds.get(key, {})["ts"] = time.time()
             return sess
         lock = self._attach_locks.setdefault(key, asyncio.Lock())
         async with lock:
             sess = self.sessions.get(key)
             if sess:
                 return sess
+            cred = self._creds.get(key)
+            if not cred:
+                raise ApiError(401, "Your terminal was paused to save usage (or the server restarted). Connect your account again.", "relink")
+            platform = claims.get("platform", "mt5")
             try:
-                account = await self._find_account(claims["login"], claims["server"])
-                if account is None:
-                    raise ApiError(401, "This account is no longer linked. Connect it again.", "relink")
-                conn = await self._open(account, 120)
-            except Exception as e:  # noqa: BLE001
-                raise explain_error(e)
-            sess = BrokerSession(key, account, conn, {
-                "login": claims["login"], "server": claims["server"],
-                "platform": claims.get("platform", "mt5"), "broker_name": claims.get("broker", ""),
-            })
+                sid = await self._start_terminal(platform, claims["login"], cred["password"], claims["server"])
+                await self._wait_ready(platform, sid, limit=90)
+            except MrpcError as e:
+                raise self._as_api_error(e)
+            sess = MrpcSession(key, self, sid, {"login": claims["login"], "server": claims["server"], "platform": platform,
+                                                "broker_name": claims.get("broker", "")})
+            cred["ts"] = time.time()
             self.sessions[key] = sess
             return sess
 
     async def drop(self, claims: Dict[str, Any]):
-        sess = self.sessions.pop(self.key(claims["login"], claims["server"]), None)
+        key = self.key(claims["login"], claims["server"])
+        sess = self.sessions.pop(key, None)
+        self._creds.pop(key, None)                        # logout wipes the password from memory
         if sess:
-            try:
-                await sess.conn.close()
-            except Exception:
-                pass
+            await self._stop(sess)
 
-    async def reap_idle(self, max_idle: int = 900):
-        """Close streaming connections nobody has touched recently and undeploy the account.
-
-        MetaApi bills deployed accounts, and closing the connection alone leaves the account deployed. Undeploying
-        stops that; session_for() redeploys on the next request (see _open)."""
+    async def reap_idle(self, max_idle: Optional[int] = None):
+        """Stop terminals nobody touched recently (the usage saver) and forget very old credentials."""
+        limit = max_idle if max_idle is not None else self.idle_seconds
+        now = time.time()
         for key, sess in list(self.sessions.items()):
-            if time.time() - sess.last_used > max_idle:
+            if now - sess.last_used > limit:
                 self.sessions.pop(key, None)
-                try:
-                    await sess.conn.close()
-                except Exception:
-                    pass
-                try:
-                    undeploy = getattr(sess.account, "undeploy", None)
-                    if undeploy:
-                        await undeploy()
-                except Exception:
-                    logging.getLogger("kanairy").warning("could not undeploy idle account %s", key)
+                await self._stop(sess)
+                log.info("paused idle terminal %s", key)
+        for key, cred in list(self._creds.items()):
+            if now - cred["ts"] > self.cred_ttl and key not in self.sessions:
+                self._creds.pop(key, None)
