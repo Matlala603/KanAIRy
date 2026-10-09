@@ -106,6 +106,22 @@ async def main():
     # ---- gateway loses the terminal mid-session: one transparent restart
     gw.alive = False
     assert (await s2.account_info() if False else await s2.positions()) is not None and gw.alive
+    # ---- an unknown endpoint (404, no "terminal gone" text) must NOT restart the terminal over and over
+    before = len([c for c in gw.log if c[0] == "/ConnectEx"])
+    import mrpc_manager as mm
+    saved_ep = dict(mm.EP); mm.EP["opened"] = "/NoSuchCall"; s2._cache.clear()
+    for _ in range(3):
+        try: await s2.positions(); raise SystemExit("should fail")
+        except ApiError as e: assert e.code == "bad_endpoint", e.code
+    assert len([c for c in gw.log if c[0] == "/ConnectEx"]) == before
+    mm.EP.update(saved_ep); s2._cache.clear()
+    # ---- AccountSummary shapes: nested / list-wrapped / alternate names
+    for shape in ([{"accountBalance": 777, "accountEquity": 800}], {"result": {"balance": 777, "equity": 800}}, {"summary": {"Balance": 777, "Equity": 800}}):
+        s2._cache.clear(); gw_account = shape
+        async def fake(name, **p): return gw_account
+        s2._call = fake
+        a = await s2.account_info(); assert a["balance"] == 777 and a["equity"] == 800, (shape, a)
+    del s2._call; s2._cache.clear()
     # ---- logout wipes everything
     await mgr.drop(claims); assert not mgr._creds and not gw.alive
     try: await mgr.session_for(claims); raise SystemExit("should need relink")
