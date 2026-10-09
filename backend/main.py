@@ -1,8 +1,8 @@
 """KanAIRY Trading API.
 
-Serves the web app and a JSON API in front of MetaApi (live broker access for
-any MetaTrader 4/5 broker) plus public market data, news and the economic
-calendar. Every account/trading route requires a signed session token.
+Serves the web app and a JSON API in front of a broker gateway (MetaRPC or
+MetaApi, chosen by BROKER_PROVIDER) plus public market data, news and the
+economic calendar. Every account/trading route requires a signed session token.
 """
 import asyncio
 import logging
@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 import auth  # noqa: E402
 from broker_manager import ApiError, BrokerManager, explain_error  # noqa: E402
+from mrpc_manager import MrpcManager  # noqa: E402
 from models import ClosePositionRequest, ConnectRequest, ModifyRequest, OrderRequest  # noqa: E402
 from public_data import BY_SYMBOL, CATALOG, PublicData, PublicError  # noqa: E402
 
@@ -46,14 +47,23 @@ app.add_middleware(
 public = PublicData()
 manager: Optional[BrokerManager] = None
 _metaapi_token = os.getenv("METAAPI_TOKEN", "").strip()
+_mrpc_key = os.getenv("MRPC_API_KEY", "").strip()
+# MetaRPC is the default whenever its key is set; BROKER_PROVIDER=metaapi forces the old gateway.
+PROVIDER = (os.getenv("BROKER_PROVIDER") or ("metarpc" if _mrpc_key else "metaapi")).strip().lower()
+IDLE_SECONDS = int(os.getenv("MRPC_IDLE_SECONDS", "600") or 600)
 
 
 def get_manager() -> BrokerManager:
     global manager
     if manager is None:
-        if not _metaapi_token:
-            raise ApiError(503, "Broker access is not configured. Set METAAPI_TOKEN on the server.", "not_configured")
-        manager = BrokerManager(_metaapi_token)
+        if PROVIDER == "metarpc":
+            if not _mrpc_key:
+                raise ApiError(503, "Broker access is not configured. Set MRPC_API_KEY on the server.", "not_configured")
+            manager = MrpcManager(_mrpc_key, idle_seconds=IDLE_SECONDS)
+        else:
+            if not _metaapi_token:
+                raise ApiError(503, "Broker access is not configured. Set METAAPI_TOKEN on the server.", "not_configured")
+            manager = BrokerManager(_metaapi_token)
     return manager
 
 
@@ -109,7 +119,10 @@ def _limit(ip: str, limit: int = 8, window: int = 300, what: str = "connection a
 # ---------- health ----------
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "metaapi": "configured" if _metaapi_token else "missing", "time": int(time.time())}
+    configured = bool(_mrpc_key) if PROVIDER == "metarpc" else bool(_metaapi_token)
+    return {"status": "ok", "provider": PROVIDER, "metaapi": "configured" if _metaapi_token else "missing",
+            "metarpc": "configured" if _mrpc_key else "missing", "broker": "configured" if configured else "missing",
+            "time": int(time.time())}
 
 
 # ---------- broker directory ----------
@@ -261,9 +274,12 @@ async def _startup():
 
     async def reaper():
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(60 if PROVIDER == "metarpc" else 300)
             if manager:
-                await manager.reap_idle()
+                try:
+                    await manager.reap_idle()
+                except Exception:  # noqa: BLE001 - the reaper must never die
+                    logging.getLogger("kanairy").exception("idle reaper failed")
     asyncio.create_task(reaper())
 
 
