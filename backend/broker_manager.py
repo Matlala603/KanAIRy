@@ -817,8 +817,11 @@ class BrokerManager:
             except Exception:
                 pass
 
-    async def reap_idle(self, max_idle: int = 1800):
-        """Close streaming connections nobody has touched recently."""
+    async def reap_idle(self, max_idle: int = 900):
+        """Close streaming connections nobody has touched recently and undeploy the account.
+
+        MetaApi bills deployed accounts, and closing the connection alone leaves the account deployed. Undeploying
+        stops that; session_for() redeploys on the next request (see _open)."""
         for key, sess in list(self.sessions.items()):
             if time.time() - sess.last_used > max_idle:
                 self.sessions.pop(key, None)
@@ -826,3 +829,9 @@ class BrokerManager:
                     await sess.conn.close()
                 except Exception:
                     pass
+                try:
+                    undeploy = getattr(sess.account, "undeploy", None)
+                    if undeploy:
+                        await undeploy()
+                except Exception:
+                    logging.getLogger("kanairy").warning("could not undeploy idle account %s", key)
