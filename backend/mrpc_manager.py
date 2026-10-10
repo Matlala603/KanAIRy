@@ -37,9 +37,10 @@ from broker_manager import (ApiError, BrokerManager, BrokerSession, ORDER_TYPES,
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("kanairy.mrpc")
-BUILD = "diag3-2026-10-10"
+BUILD = "diag4-2026-10-10"
+INSTANCE = uuid.uuid4().hex[:6]            # differs per running copy of the app: shows if two copies share the traffic
 DIAG: "deque[str]" = deque(maxlen=60)     # recent failures / first replies, served by /api/health/mrpc when MRPC_DEBUG=1
-log.warning("MetaRPC adapter loaded (build %s)", BUILD)
+log.warning("MetaRPC adapter loaded (build %s, instance %s)", BUILD, INSTANCE)
 
 HOSTS = {"mt4": "https://mt4.mrpc.pro", "mt5": "https://mt5.mrpc.pro"}
 
@@ -70,6 +71,7 @@ BAD_LOGIN = re.compile(r"password|invalid account|invalid login|authori[sz]|wron
                        r"no connection|invalid.*server|account.*disabled", re.I)
 SESSION_GONE = re.compile(r"not connected|no such (terminal|session)|unknown (id|terminal|session)|terminal.*(not|stopped)|"
                           r"session.*(expired|not found)|invalid id", re.I)
+STALLED = re.compile(r"NOT_POLLING|not polling|TERMINAL_API_TIMEOUT|heartbeat", re.I)   # MetaRPC's terminal helper stopped answering
 CID_TAG = "kr:"
 
 
@@ -229,8 +231,9 @@ class MrpcSession(BrokerSession):
             return res
         except MrpcError as e:
             self.mgr._debug_seen(name, f"HTTP {e.status}: {e.message}", failed=True)
-            if SESSION_GONE.search(e.message):                 # only an explicit "terminal gone" message restarts it
-                await self.mgr._reconnect(self)
+            stalled = bool(STALLED.search(e.message))
+            if stalled or SESSION_GONE.search(e.message):      # only an explicit "terminal gone / stalled" message restarts it
+                await self.mgr._reconnect(self, stop_first=stalled)
                 try:
                     return await self.mgr.client.call(self.platform, EP[name], params, self.sid)
                 except MrpcError as e2:
@@ -254,7 +257,7 @@ class MrpcSession(BrokerSession):
     # --- account
     async def account_info(self) -> Dict[str, Any]:
         self.last_used = time.time()
-        raw = _flat(await self._cached("account", 1.5, lambda: self._call("account")))
+        raw = _flat(await self._cached("account", 2.5, lambda: self._call("account")))
         if not any(k in {x.lower() for x in raw} for k in ("balance", "equity", "accountbalance", "accountequity")):
             self.mgr._warn_once("account-keys", "AccountSummary has no recognisable balance field; keys seen: %s" % sorted(raw)[:40])
         margin = _num(_g(raw, "margin", "accountMargin", "usedMargin"))
@@ -279,7 +282,7 @@ class MrpcSession(BrokerSession):
 
     # --- positions and pending orders (both come from one OpenedOrders call)
     async def _opened(self) -> List[Dict[str, Any]]:
-        return await self._cached("opened", 1.5, self._fetch_opened)
+        return await self._cached("opened", 2.5, self._fetch_opened)
 
     async def _fetch_opened(self):
         return _rows(await self._call("opened"), "orders", "positions")
@@ -367,7 +370,7 @@ class MrpcSession(BrokerSession):
                 async with sem:
                     return _unwrap(await self._call("quote", symbol=sym))
             try:
-                q = await self._cached("q:" + sym, 1.0, fetch)
+                q = await self._cached("q:" + sym, 2.0, fetch)
             except (ApiError, MrpcError):
                 return sym, None
             bid, ask = _num(_g(q, "bid")), _num(_g(q, "ask"))
@@ -646,15 +649,18 @@ class MrpcManager(BrokerManager):
         except Exception as e:  # noqa: BLE001 - nothing useful to do if the stop call fails
             log.info("disconnect failed for %s: %s", sess.key, type(e).__name__)
 
-    async def _reconnect(self, sess: MrpcSession):
+    async def _reconnect(self, sess: MrpcSession, stop_first: bool = False):
         """Start the terminal again from the in-memory credentials (after the gateway lost it)."""
         cred = self._creds.get(sess.key)
         if not cred:
             self.sessions.pop(sess.key, None)
             raise ApiError(401, "This session was paused. Connect your account again.", "relink")
         if time.time() - getattr(sess, "last_restart", 0) < 60:       # never restart in a loop
-            raise ApiError(502, "The broker terminal keeps dropping. Wait a minute and try again.", "upstream_error")
+            raise ApiError(502, "Your broker terminal is restarting. Prices and trading resume in about a minute.", "upstream_error")
         sess.last_restart = time.time()
+        log.warning("restarting stalled/lost terminal for %s (instance %s)", sess.key, INSTANCE)
+        if stop_first:
+            await self._stop(sess)
         lock = self._attach_locks.setdefault(sess.key, asyncio.Lock())
         async with lock:
             try:
@@ -679,7 +685,7 @@ class MrpcManager(BrokerManager):
                 return sess
             cred = self._creds.get(key)
             if not cred:
-                log.warning("relink needed for %s: no in-memory credentials (server restarted, idle > %ss, or logged out)", key, self.cred_ttl)
+                log.warning("relink needed for %s on instance %s: no in-memory credentials (server restarted, a second app copy, or logged out)", key, INSTANCE)
                 raise ApiError(401, "Your terminal was paused to save usage (or the server restarted). Connect your account again.", "relink")
             platform = claims.get("platform", "mt5")
             try:
