@@ -37,7 +37,7 @@ from broker_manager import (ApiError, BrokerManager, BrokerSession, ORDER_TYPES,
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("kanairy.mrpc")
-BUILD = "diag4-2026-10-10"
+BUILD = "diag5-2026-10-10"
 INSTANCE = uuid.uuid4().hex[:6]            # differs per running copy of the app: shows if two copies share the traffic
 DIAG: "deque[str]" = deque(maxlen=60)     # recent failures / first replies, served by /api/health/mrpc when MRPC_DEBUG=1
 log.warning("MetaRPC adapter loaded (build %s, instance %s)", BUILD, INSTANCE)
@@ -129,10 +129,12 @@ def _flat(res: Any) -> Dict[str, Any]:
 
 
 def _optype(v: Any) -> str:
-    """Normalise any order-type spelling to e.g. 'buylimit'."""
-    if isinstance(v, (int, float)) and int(v) in OP_BY_INT:
+    """Normalise any order-type spelling to e.g. 'buylimit' (ints, 'Buy', 'ORDER_TYPE_BUY_LIMIT', 'POSITION_TYPE_SELL')."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) in OP_BY_INT:
         return OP_BY_INT[int(v)]
-    s = re.sub(r"[^a-z]", "", str(v or "").lower().replace("ordertype", "").replace("positiontype", ""))
+    s = re.sub(r"[^a-z]", "", str(v or "").lower())
+    for prefix in ("ordertype", "positiontype", "dealtype"):
+        s = s.replace(prefix, "")
     return s
 
 
@@ -225,6 +227,7 @@ class MrpcSession(BrokerSession):
 
     # --- transport with one transparent restart if the gateway lost the terminal
     async def _call(self, name: str, **params) -> Any:
+        used_sid = self.sid
         try:
             res = await self.mgr.client.call(self.platform, EP[name], params, self.sid)
             self.mgr._debug_seen(name, res)
@@ -233,7 +236,8 @@ class MrpcSession(BrokerSession):
             self.mgr._debug_seen(name, f"HTTP {e.status}: {e.message}", failed=True)
             stalled = bool(STALLED.search(e.message))
             if stalled or SESSION_GONE.search(e.message):      # only an explicit "terminal gone / stalled" message restarts it
-                await self.mgr._reconnect(self, stop_first=stalled)
+                if self.sid == used_sid:                       # (if a parallel call already restarted it, just retry on the new id)
+                    await self.mgr._reconnect(self, stop_first=stalled)
                 try:
                     return await self.mgr.client.call(self.platform, EP[name], params, self.sid)
                 except MrpcError as e2:
@@ -285,22 +289,35 @@ class MrpcSession(BrokerSession):
         return await self._cached("opened", 2.5, self._fetch_opened)
 
     async def _fetch_opened(self):
-        return _rows(await self._call("opened"), "orders", "positions")
+        res = _unwrap(await self._call("opened"))
+        out: List[Dict[str, Any]] = []
+        if isinstance(res, dict):
+            for r in _g(res, "positionInfos", "positions", "positionInfo", default=[]) or []:
+                if isinstance(r, dict):
+                    out.append({**r, "_pos": True})
+            for r in _g(res, "openedOrders", "orders", "opened_orders", default=[]) or []:
+                if isinstance(r, dict):
+                    out.append(r)
+        elif isinstance(res, list):
+            out = [r for r in res if isinstance(r, dict)]
+        if out:
+            self.mgr._debug_seen("opened_nonempty", out[:2])      # MRPC_DEBUG: the first reply that actually holds trades
+        return out
 
     @staticmethod
     def _ticket(r) -> str:
-        return str(_g(r, "ticket", "id", "order", "positionId", default=""))
+        return str(_g(r, "ticket", "id", "order", "positionId", "identifier", default=""))
 
     async def positions(self) -> List[Dict[str, Any]]:
         self.last_used = time.time()
         out = []
         for r in await self._opened():
-            t = _optype(_g(r, "type", "orderType", "cmd", "operation"))
+            t = _optype(_g(r, "type", "orderType", "positionType", "cmd", "operation", "side")) or ("buy" if r.get("_pos") else "")
             if not t or _pending(t):
                 continue
             out.append({
                 "id": self._ticket(r), "symbol": _g(r, "symbol"), "side": _side(t),
-                "volume": _num(_g(r, "lots", "volume")), "openPrice": _num(_g(r, "openPrice", "priceOpen")),
+                "volume": _num(_g(r, "lots", "volume", "volumeInitial", "volumeCurrent")), "openPrice": _num(_g(r, "openPrice", "priceOpen")),
                 "currentPrice": _num(_g(r, "closePrice", "currentPrice", "priceCurrent")),
                 "stopLoss": _g(r, "stopLoss", "sl") or None, "takeProfit": _g(r, "takeProfit", "tp") or None,
                 "profit": _num(_g(r, "profit")), "swap": _num(_g(r, "swap")),
@@ -313,13 +330,13 @@ class MrpcSession(BrokerSession):
         self.last_used = time.time()
         out = []
         for r in await self._opened():
-            t = _optype(_g(r, "type", "orderType", "cmd", "operation"))
+            t = _optype(_g(r, "type", "orderType", "positionType", "cmd", "operation", "side"))
             if not t or not _pending(t):
                 continue
             out.append({
                 "id": self._ticket(r), "symbol": _g(r, "symbol"), "type": _pretty_type(t), "side": _side(t),
-                "volume": _num(_g(r, "lots", "volume")), "price": _num(_g(r, "openPrice", "price")),
-                "stopLimitPrice": _g(r, "stopLimitPrice", "stopLimit"),
+                "volume": _num(_g(r, "lots", "volume", "volumeInitial", "volumeCurrent")), "price": _num(_g(r, "openPrice", "priceOpen", "price")),
+                "stopLimitPrice": _g(r, "stopLimitPrice", "stopLimit", "priceStopLimit"),
                 "stopLoss": _g(r, "stopLoss", "sl") or None, "takeProfit": _g(r, "takeProfit", "tp") or None,
                 "currentPrice": _g(r, "closePrice", "currentPrice"),
                 "time": _epoch(_g(r, "openTime", "time")), "expiration": _epoch(_g(r, "expiration", "expirationTime")),
@@ -382,6 +399,11 @@ class MrpcSession(BrokerSession):
         return {s: q for s, q in pairs if q}
 
     async def candles(self, symbol: str, timeframe: str, limit: int, before: Optional[int]) -> List[Dict[str, Any]]:
+        if not self.mgr.broker_candles:
+            if self.mgr.fallback_candles is None:
+                raise ApiError(502, "Broker candles are switched off (set MRPC_BROKER_CANDLES=1 to try them).", "upstream_error")
+            rows = await self.mgr.fallback_candles(symbol, timeframe, min(max(limit, 1), 2000))
+            return [r for r in rows if not before or r["t"] < before]
         if timeframe not in TF_MINUTES:
             raise ApiError(400, f"Unsupported timeframe {timeframe}")
         limit = max(1, min(limit, 1000))
@@ -410,7 +432,7 @@ class MrpcSession(BrokerSession):
                     "orders", "history", "deals")
         out = []
         for d in raw:
-            t = _optype(_g(d, "type", "orderType", "cmd", "operation"))
+            t = _optype(_g(d, "type", "orderType", "positionType", "cmd", "operation", "side"))
             when = _epoch(_g(d, "closeTime", "time", "openTime"))
             if t in BALANCE_TYPES or (not t.startswith(("buy", "sell"))):
                 out.append({"id": self._ticket(d), "kind": "balance", "symbol": "", "time": when,
@@ -432,7 +454,7 @@ class MrpcSession(BrokerSession):
         self._cache.pop("opened", None)
         for r in await self._fetch_opened():
             if tag in str(_g(r, "comment", default="")):
-                t = _optype(_g(r, "type", "orderType", "cmd", "operation"))
+                t = _optype(_g(r, "type", "orderType", "positionType", "cmd", "operation", "side"))
                 tk = self._ticket(r)
                 if _pending(t):
                     return {"status": "working", "orderId": tk, "positionId": ""}
@@ -550,8 +572,11 @@ def _guess_category(name: str) -> str:
 class MrpcManager(BrokerManager):
     """Same public surface as BrokerManager, backed by MetaRPC."""
 
-    def __init__(self, api_key: str, http: Optional[httpx.AsyncClient] = None, idle_seconds: int = 600, cred_ttl: int = 12 * 3600):
+    def __init__(self, api_key: str, http: Optional[httpx.AsyncClient] = None, idle_seconds: int = 600, cred_ttl: int = 12 * 3600,
+                 fallback_candles=None):
         self.token = api_key
+        self.fallback_candles = fallback_candles           # async (symbol, timeframe, limit) -> rows; the public price feed
+        self.broker_candles = os.getenv("MRPC_BROKER_CANDLES", "").strip() not in ("", "0", "false")
         self.client = MrpcHttp(api_key, http)
         self.http = self.client.http
         self.idle_seconds = idle_seconds
@@ -651,6 +676,10 @@ class MrpcManager(BrokerManager):
 
     async def _reconnect(self, sess: MrpcSession, stop_first: bool = False):
         """Start the terminal again from the in-memory credentials (after the gateway lost it)."""
+        lock = self._attach_locks.setdefault(sess.key, asyncio.Lock())
+        if lock.locked():                                   # a restart is already running: wait for it, then the caller retries
+            async with lock:
+                return
         cred = self._creds.get(sess.key)
         if not cred:
             self.sessions.pop(sess.key, None)
@@ -661,7 +690,6 @@ class MrpcManager(BrokerManager):
         log.warning("restarting stalled/lost terminal for %s (instance %s)", sess.key, INSTANCE)
         if stop_first:
             await self._stop(sess)
-        lock = self._attach_locks.setdefault(sess.key, asyncio.Lock())
         async with lock:
             try:
                 sid = await self._start_terminal(sess.platform, sess.info["login"], cred["password"], sess.info["server"])
