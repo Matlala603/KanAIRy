@@ -23,6 +23,7 @@ import os
 import re
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -36,6 +37,9 @@ from broker_manager import (ApiError, BrokerManager, BrokerSession, ORDER_TYPES,
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("kanairy.mrpc")
+BUILD = "diag3-2026-10-10"
+DIAG: "deque[str]" = deque(maxlen=60)     # recent failures / first replies, served by /api/health/mrpc when MRPC_DEBUG=1
+log.warning("MetaRPC adapter loaded (build %s)", BUILD)
 
 HOSTS = {"mt4": "https://mt4.mrpc.pro", "mt5": "https://mt5.mrpc.pro"}
 
@@ -147,7 +151,20 @@ def _pretty_type(t: str) -> str:
 class MrpcHttp:
     def __init__(self, api_key: str, http: Optional[httpx.AsyncClient] = None):
         self.api_key = api_key
-        self.http = http or httpx.AsyncClient(timeout=20)
+        self.http = http or httpx.AsyncClient(timeout=15)
+        self._logged: set = set()
+
+    def _log_once(self, path: str, what: str, body: str = "", params: Optional[Dict[str, Any]] = None):
+        """One WARNING per distinct (path, what): enough to diagnose in the host's logs without flooding them."""
+        k = (path, what)
+        if k in self._logged:
+            return
+        self._logged.add(k)
+        keys = sorted((params or {}).keys())
+        for secret_key in ("password",):
+            body = body.replace(str((params or {}).get(secret_key, "\0")), "***")
+        log.warning("MRPC %s %s | param names: %s | reply: %s", path, what, keys, body[:300])
+        DIAG.append(f"{time.strftime('%H:%M:%S')} {path} {what} | params {keys} | reply {body[:300]}")
 
     async def call(self, platform: str, path: str, params: Optional[Dict[str, Any]] = None, sid: Optional[str] = None) -> Any:
         headers = {"APIKey": self.api_key}
@@ -158,13 +175,17 @@ class MrpcHttp:
         try:
             r = await self.http.get(HOSTS[platform] + path, params=q, headers=headers)
         except httpx.TimeoutException as e:
+            self._log_once(path, "TIMEOUT", "", q)
             raise ApiError(504, "The broker gateway did not answer in time. Try again.", "timeout") from e
         except httpx.HTTPError as e:
+            self._log_once(path, f"UNREACHABLE {type(e).__name__}", "", q)
             raise ApiError(502, f"Could not reach {HOSTS[platform].split('//')[1]} ({type(e).__name__}). Check the server's internet access.", "upstream_error") from e
         text = r.text or ""
         if r.status_code in (401, 403) and not BAD_LOGIN.search(text):
             log.warning("MetaRPC refused the key: HTTP %s from %s%s -> %s", r.status_code, HOSTS[platform].split("//")[1], path, text[:200])
             raise ApiError(502, f"MetaRPC refused the API key (HTTP {r.status_code} from {HOSTS[platform].split('//')[1]}). Use the key from mrpc.pro/my > API Keys as MRPC_API_KEY, and check your plan covers {platform.upper()}.", "mrpc_auth")
+        if r.status_code >= 400:
+            self._log_once(path, f"HTTP {r.status_code}", text, q)
         if r.status_code == 429:
             raise ApiError(429, "The broker gateway is rate limiting requests. Wait a moment.", "rate_limited")
         if r.status_code >= 500:
@@ -550,7 +571,8 @@ class MrpcManager(BrokerManager):
             body = res if isinstance(res, str) else json.dumps(res, default=str)
         except Exception:  # noqa: BLE001
             body = str(res)
-        log.info("MRPC_DEBUG %s%s %s -> %s", "FAILED " if failed else "", name, EP.get(name, ""), body[:700])
+        log.warning("MRPC_DEBUG %s%s %s -> %s", "FAILED " if failed else "", name, EP.get(name, ""), body[:700])
+        DIAG.append(f"{time.strftime('%H:%M:%S')} OK-SHAPE {name} {EP.get(name, '')} -> {body[:700]}" if not failed else f"{time.strftime('%H:%M:%S')} FAILED {name} {body[:300]}")
 
     def _warn_once(self, key: str, msg: str):
         if key not in self._seen:
@@ -565,17 +587,17 @@ class MrpcManager(BrokerManager):
         return {}
 
     @staticmethod
-    def _as_api_error(e: MrpcError) -> ApiError:
-        if BAD_LOGIN.search(e.message):
+    def _as_api_error(e: MrpcError, connecting: bool = False) -> ApiError:
+        if connecting and BAD_LOGIN.search(e.message):
             return ApiError(401, "The broker did not accept this login. Check the account number, the trading password (not the investor password) and that the server name matches your MetaTrader terminal exactly.", "bad_credentials")
-        return ApiError(e.status if 400 <= e.status < 600 else 502, e.message or "The broker gateway refused the request.", "upstream_error")
+        return ApiError(502, f"MetaRPC says: {e.message}"[:300] if e.message else "The broker gateway refused the request.", "upstream_error")
 
     async def _start_terminal(self, platform: str, login: str, password: str, server: str) -> str:
         try:
             res = await self.client.call(platform, EP["connect"], {"user": login, "password": password, "mtClusterName": server})
             return _parse_sid(res)
         except MrpcError as e:
-            raise self._as_api_error(e)
+            raise self._as_api_error(e, connecting=True)
 
     async def _wait_ready(self, platform: str, sid: str, job_id: Optional[str] = None, limit: int = 90):
         deadline = time.time() + limit
@@ -587,7 +609,7 @@ class MrpcManager(BrokerManager):
             except MrpcError as e:
                 last = e
                 if BAD_LOGIN.search(e.message) and not SESSION_GONE.search(e.message):
-                    raise self._as_api_error(e)
+                    raise self._as_api_error(e, connecting=True)
             await asyncio.sleep(2)
         raise ApiError(504, "The broker did not answer in time. Check the server name and password, then try again.", "timeout") from last
 
@@ -639,7 +661,7 @@ class MrpcManager(BrokerManager):
                 sid = await self._start_terminal(sess.platform, sess.info["login"], cred["password"], sess.info["server"])
                 await self._wait_ready(sess.platform, sid, limit=60)
             except MrpcError as e:
-                raise self._as_api_error(e)
+                raise self._as_api_error(e, connecting=True)
             sess.sid = sid
             sess._cache.clear()
 
@@ -657,13 +679,14 @@ class MrpcManager(BrokerManager):
                 return sess
             cred = self._creds.get(key)
             if not cred:
+                log.warning("relink needed for %s: no in-memory credentials (server restarted, idle > %ss, or logged out)", key, self.cred_ttl)
                 raise ApiError(401, "Your terminal was paused to save usage (or the server restarted). Connect your account again.", "relink")
             platform = claims.get("platform", "mt5")
             try:
                 sid = await self._start_terminal(platform, claims["login"], cred["password"], claims["server"])
                 await self._wait_ready(platform, sid, limit=90)
             except MrpcError as e:
-                raise self._as_api_error(e)
+                raise self._as_api_error(e, connecting=True)
             sess = MrpcSession(key, self, sid, {"login": claims["login"], "server": claims["server"], "platform": platform,
                                                 "broker_name": claims.get("broker", "")})
             cred["ts"] = time.time()
