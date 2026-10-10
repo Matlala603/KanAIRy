@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 import auth  # noqa: E402
 from broker_manager import ApiError, BrokerManager, explain_error  # noqa: E402
-from mrpc_manager import MrpcManager  # noqa: E402
+from mrpc_manager import BUILD as MRPC_BUILD, DIAG as MRPC_DIAG, MrpcManager  # noqa: E402
 from models import ClosePositionRequest, ConnectRequest, ModifyRequest, OrderRequest  # noqa: E402
 from public_data import BY_SYMBOL, CATALOG, PublicData, PublicError  # noqa: E402
 
@@ -117,10 +117,18 @@ def _limit(ip: str, limit: int = 8, window: int = 300, what: str = "connection a
 
 
 # ---------- health ----------
+@app.get("/api/health/mrpc")
+async def health_mrpc():
+    """Recent MetaRPC failures and the first reply of each call. Only when MRPC_DEBUG=1; turn it off afterwards."""
+    if os.getenv("MRPC_DEBUG", "").strip() in ("", "0", "false"):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    return {"build": MRPC_BUILD, "provider": PROVIDER, "lines": list(MRPC_DIAG)}
+
+
 @app.get("/api/health")
 async def health():
     configured = bool(_mrpc_key) if PROVIDER == "metarpc" else bool(_metaapi_token)
-    return {"status": "ok", "provider": PROVIDER, "metaapi": "configured" if _metaapi_token else "missing",
+    return {"status": "ok", "provider": PROVIDER, "mrpc_build": MRPC_BUILD, "metaapi": "configured" if _metaapi_token else "missing",
             "metarpc": "configured" if _mrpc_key else "missing", "broker": "configured" if configured else "missing",
             "time": int(time.time())}
 
