@@ -22,6 +22,7 @@ class Gateway:
             {"ticket": 9, "symbol": "EURUSD", "type": "BuyLimit", "lots": 0.1, "openPrice": 1.05, "comment": ""},
         ]
         self.fail_send_after_accept = False
+        self.stall = False
     def handler(self, req: httpx.Request) -> httpx.Response:
         path, q, h = req.url.path, dict(req.url.params), req.headers
         self.log.append((path, q, dict(h)))
@@ -33,6 +34,9 @@ class Gateway:
             self.alive = False; return httpx.Response(200, json="ok")
         if not self.alive or h.get("id") != SID:
             return httpx.Response(404, json={"message": "Terminal not connected"})
+        if path == "/AccountSummary" and self.stall:
+            self.stall = False
+            return httpx.Response(400, json={"type": "TERMINAL_API_TIMEOUT", "errorCode": "TERMINAL_SCRIPT_NOT_POLLING", "errorMessage": "MQL script is not polling commands (last heartbeat was 30s ago)."})
         if path == "/AccountSummary": return httpx.Response(200, json={"balance": 1000, "equity": 1010, "margin": 10, "freeMargin": 1000, "currency": "USD", "leverage": 500, "login": 123456})
         if path == "/OpenedOrders": return httpx.Response(200, json=self.opened)
         if path == "/SymbolParams": return httpx.Response(200, json={"minVolume": 0.01, "maxVolume": 50, "volumeStep": 0.01, "digits": 5})
@@ -122,6 +126,11 @@ async def main():
         s2._call = fake
         a = await s2.account_info(); assert a["balance"] == 777 and a["equity"] == 800, (shape, a)
     del s2._call; s2._cache.clear()
+    # ---- stalled terminal (real MetaRPC error): stop + start once, then the call succeeds
+    s2.last_restart = 0; s2._cache.clear(); gw.stall = True
+    stops = len([c for c in gw.log if c[0] == "/Disconnect"]); starts = len([c for c in gw.log if c[0] == "/ConnectEx"])
+    assert (await s2.account_info())["balance"] == 1000
+    assert len([c for c in gw.log if c[0] == "/Disconnect"]) == stops + 1 and len([c for c in gw.log if c[0] == "/ConnectEx"]) == starts + 1
     # ---- logout wipes everything
     await mgr.drop(claims); assert not mgr._creds and not gw.alive
     try: await mgr.session_for(claims); raise SystemExit("should need relink")
