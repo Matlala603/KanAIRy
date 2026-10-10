@@ -17,7 +17,9 @@ Endpoint status
   Run `python3 scripts/mrpc_probe.py` against a demo account first; it shows which calls work and their real shape.
 """
 import asyncio
+import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -105,6 +107,21 @@ def _rows(res: Any, *keys: str) -> List[Dict[str, Any]]:
     return [r for r in (res or []) if isinstance(r, dict)]
 
 
+def _flat(res: Any) -> Dict[str, Any]:
+    """AccountSummary as one flat dict, whether the gateway wraps it in a list / result / nested object."""
+    res = _unwrap(res)
+    if isinstance(res, list):
+        res = res[0] if res and isinstance(res[0], dict) else {}
+    if not isinstance(res, dict):
+        return {}
+    out = dict(res)
+    for v in res.values():
+        if isinstance(v, dict):
+            for k, x in v.items():
+                out.setdefault(k, x)
+    return out
+
+
 def _optype(v: Any) -> str:
     """Normalise any order-type spelling to e.g. 'buylimit'."""
     if isinstance(v, (int, float)) and int(v) in OP_BY_INT:
@@ -143,10 +160,11 @@ class MrpcHttp:
         except httpx.TimeoutException as e:
             raise ApiError(504, "The broker gateway did not answer in time. Try again.", "timeout") from e
         except httpx.HTTPError as e:
-            raise ApiError(502, "Could not reach the MetaRPC gateway.", "upstream_error") from e
+            raise ApiError(502, f"Could not reach {HOSTS[platform].split('//')[1]} ({type(e).__name__}). Check the server's internet access.", "upstream_error") from e
         text = r.text or ""
         if r.status_code in (401, 403) and not BAD_LOGIN.search(text):
-            raise ApiError(502, "The MetaRPC API key was refused or lacks permission. The server operator needs to check MRPC_API_KEY and the MetaRPC plan.", "mrpc_auth")
+            log.warning("MetaRPC refused the key: HTTP %s from %s%s -> %s", r.status_code, HOSTS[platform].split("//")[1], path, text[:200])
+            raise ApiError(502, f"MetaRPC refused the API key (HTTP {r.status_code} from {HOSTS[platform].split('//')[1]}). Use the key from mrpc.pro/my > API Keys as MRPC_API_KEY, and check your plan covers {platform.upper()}.", "mrpc_auth")
         if r.status_code == 429:
             raise ApiError(429, "The broker gateway is rate limiting requests. Wait a moment.", "rate_limited")
         if r.status_code >= 500:
@@ -185,14 +203,19 @@ class MrpcSession(BrokerSession):
     # --- transport with one transparent restart if the gateway lost the terminal
     async def _call(self, name: str, **params) -> Any:
         try:
-            return await self.mgr.client.call(self.platform, EP[name], params, self.sid)
+            res = await self.mgr.client.call(self.platform, EP[name], params, self.sid)
+            self.mgr._debug_seen(name, res)
+            return res
         except MrpcError as e:
-            if e.status in (404, 410) or SESSION_GONE.search(e.message):
+            self.mgr._debug_seen(name, f"HTTP {e.status}: {e.message}", failed=True)
+            if SESSION_GONE.search(e.message):                 # only an explicit "terminal gone" message restarts it
                 await self.mgr._reconnect(self)
                 try:
                     return await self.mgr.client.call(self.platform, EP[name], params, self.sid)
                 except MrpcError as e2:
                     raise self.mgr._as_api_error(e2)
+            if e.status in (404, 405):                         # wrong path/verb: a code problem, not a lost terminal
+                raise ApiError(502, f"The MetaRPC gateway has no call {EP[name]}. The server operator must correct it in mrpc_manager.py (EP table).", "bad_endpoint")
             raise self.mgr._as_api_error(e)
 
     async def _cached(self, name: str, ttl: float, fn):
@@ -210,22 +233,25 @@ class MrpcSession(BrokerSession):
     # --- account
     async def account_info(self) -> Dict[str, Any]:
         self.last_used = time.time()
-        raw = _unwrap(await self._cached("account", 1.5, lambda: self._call("account")))
-        margin, equity = _num(_g(raw, "margin")), _num(_g(raw, "equity"))
+        raw = _flat(await self._cached("account", 1.5, lambda: self._call("account")))
+        if not any(k in {x.lower() for x in raw} for k in ("balance", "equity", "accountbalance", "accountequity")):
+            self.mgr._warn_once("account-keys", "AccountSummary has no recognisable balance field; keys seen: %s" % sorted(raw)[:40])
+        margin = _num(_g(raw, "margin", "accountMargin", "usedMargin"))
+        equity = _num(_g(raw, "equity", "accountEquity"))
         return {
-            "login": str(_g(raw, "login", "account", default=self.info["login"])),
-            "name": _g(raw, "name", "userName", default="") or "",
-            "broker": _g(raw, "company", "broker", default="") or self.info.get("broker_name") or "",
-            "server": _g(raw, "server", default=self.info["server"]),
+            "login": str(_g(raw, "login", "account", "accountNumber", default=self.info["login"])),
+            "name": _g(raw, "name", "userName", "accountName", default="") or "",
+            "broker": _g(raw, "company", "broker", "companyName", default="") or self.info.get("broker_name") or "",
+            "server": _g(raw, "server", "serverName", default=self.info["server"]),
             "platform": self.platform,
-            "currency": _g(raw, "currency", default="USD") or "USD",
-            "leverage": _g(raw, "leverage"),
-            "balance": _num(_g(raw, "balance")),
+            "currency": _g(raw, "currency", "accountCurrency", "depositCurrency", default="USD") or "USD",
+            "leverage": _g(raw, "leverage", "accountLeverage"),
+            "balance": _num(_g(raw, "balance", "accountBalance")),
             "equity": equity,
             "margin": margin,
-            "freeMargin": _num(_g(raw, "freeMargin", "free_margin", "marginFree")),
+            "freeMargin": _num(_g(raw, "freeMargin", "free_margin", "marginFree", "accountFreeMargin")),
             "marginLevel": (equity / margin * 100) if margin > 0 else None,
-            "credit": _num(_g(raw, "credit")),
+            "credit": _num(_g(raw, "credit", "accountCredit")),
             "tradeAllowed": not bool(_g(raw, "isInvestor", "investor", default=False)),
             "type": _g(raw, "accountType", "tradeMode"),
         }
@@ -511,6 +537,25 @@ class MrpcManager(BrokerManager):
         self._attach_locks: Dict[str, asyncio.Lock] = {}
         self._broker_cache: Dict[str, Any] = {}
         self._creds: Dict[str, Dict[str, Any]] = {}      # in memory only, see module docstring
+        self.debug = os.getenv("MRPC_DEBUG", "").strip() not in ("", "0", "false")
+        self._seen: set = set()
+
+    def _debug_seen(self, name: str, res: Any, failed: bool = False):
+        """MRPC_DEBUG=1: log each call's first real response (never ConnectEx, so no password) to learn the true shapes."""
+        k = (name, failed)
+        if not self.debug or k in self._seen:
+            return
+        self._seen.add(k)
+        try:
+            body = res if isinstance(res, str) else json.dumps(res, default=str)
+        except Exception:  # noqa: BLE001
+            body = str(res)
+        log.info("MRPC_DEBUG %s%s %s -> %s", "FAILED " if failed else "", name, EP.get(name, ""), body[:700])
+
+    def _warn_once(self, key: str, msg: str):
+        if key not in self._seen:
+            self._seen.add(key)
+            log.warning(msg)
 
     # MetaRPC has no server directory; the connect screen's manual "server name" field is the way in.
     async def search_brokers(self, query: str, version: int = 5) -> Dict[str, List[str]]:
@@ -585,6 +630,9 @@ class MrpcManager(BrokerManager):
         if not cred:
             self.sessions.pop(sess.key, None)
             raise ApiError(401, "This session was paused. Connect your account again.", "relink")
+        if time.time() - getattr(sess, "last_restart", 0) < 60:       # never restart in a loop
+            raise ApiError(502, "The broker terminal keeps dropping. Wait a minute and try again.", "upstream_error")
+        sess.last_restart = time.time()
         lock = self._attach_locks.setdefault(sess.key, asyncio.Lock())
         async with lock:
             try:
