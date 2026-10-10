@@ -59,7 +59,7 @@ def get_manager() -> BrokerManager:
         if PROVIDER == "metarpc":
             if not _mrpc_key:
                 raise ApiError(503, "Broker access is not configured. Set MRPC_API_KEY on the server.", "not_configured")
-            manager = MrpcManager(_mrpc_key, idle_seconds=IDLE_SECONDS)
+            manager = MrpcManager(_mrpc_key, idle_seconds=IDLE_SECONDS, fallback_candles=public.candles)
         else:
             if not _metaapi_token:
                 raise ApiError(503, "Broker access is not configured. Set METAAPI_TOKEN on the server.", "not_configured")
